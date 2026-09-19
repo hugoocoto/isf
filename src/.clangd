@@ -1,0 +1,9 @@
+CompileFlags:
+  Add:
+    - -xc
+    - -std=gnu17
+    - -Wall
+    - -Wextra
+    - -I../thirdparty/flag.h
+    - -I../thirdparty/cum.h
+    - -I../thirdparty/bt.h

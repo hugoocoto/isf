@@ -1,0 +1,38 @@
+#!/bin/sh
+# Stands in for ssh in the tests: the "remote" is this machine, with
+# $ISF_TEST_REMOTE as its home. isf runs ssh two ways:
+#   ssh [opts] -s -- HOST sftp        an SFTP session
+#   ssh [opts] -- HOST 'CMD'          the agent
+# With $ISF_TEST_LATENCY_MS, SFTP traffic is delayed by that round trip.
+# Sessions start in $ISF_TEST_REMOTE, which the "remote" paths start from.
+
+subsystem=0
+while [ $# -gt 0 ]; do
+        case "$1" in
+        -s) subsystem=1; shift ;;
+        -p | -l | -i | -F | -o) shift 2 ;; # options with a separate argument
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+        esac
+done
+[ $# -ge 2 ] || { echo "fake-ssh: no host or command" >&2; exit 255; }
+shift # the host
+cd "$ISF_TEST_REMOTE" || exit 255
+
+if [ $subsystem = 1 ]; then
+        [ "$1" = sftp ] || { echo "fake-ssh: unknown subsystem '$1'" >&2; exit 255; }
+        # With $ISF_TEST_SFTP_LIMIT, the SFTP sessions after that many fail
+        if [ -n "${ISF_TEST_SFTP_LIMIT:-}" ]; then
+                i=1
+                until mkdir "$ISF_TEST_REMOTE/../sftp-session-$i" 2>/dev/null; do
+                        i=$((i + 1))
+                done
+                [ $i -le "$ISF_TEST_SFTP_LIMIT" ] || { echo "fake-ssh: session refused" >&2; exit 255; }
+        fi
+        if [ -n "${ISF_TEST_LATENCY_MS:-}" ]; then
+                exec python3 "$(dirname "$(readlink -f "$0")")/latency.py" "$ISF_TEST_LATENCY_MS" "$SFTP_SERVER"
+        fi
+        exec "$SFTP_SERVER"
+fi
+exec sh -c "$*"

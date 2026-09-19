@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=isf
+Comment=Keep a local folder and a remote one the same, both ways, over ssh
+Exec=isf
+Icon=isf
+Terminal=true
+NoDisplay=true
+Categories=Network;FileTransfer;

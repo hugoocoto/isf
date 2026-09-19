@@ -1,0 +1,92 @@
+name: Release
+
+# Every push to main updates the "nightly" release, and a v* tag makes a
+# release of its own. Each has, for x86_64 and aarch64, the static binary (for
+# the remote too: it runs on any Linux) and the AppImage, plus the source with
+# its submodules and the checksums of all of them.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # git describe needs the tags, for isf --version
+
+      - name: Test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-sftp-server
+          sudo sysctl -w fs.inotify.max_user_watches=524288 # t-wide watches thousands
+          make test
+
+      - name: Build
+        run: |
+          make clean
+          LDFLAGS=-s make STATIC=1
+          ./isf --version
+          cp isf "isf-$(uname -m)"
+          ./appimage.sh isf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isf-${{ matrix.runner }}
+          path: isf-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Source and checksums
+        run: |
+          git ls-files --recurse-submodules | tar --transform 's,^,isf/,' -czf dist/isf-src.tar.gz -T -
+          cd dist && sha256sum * >SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "isf $GITHUB_REF_NAME" --generate-notes
+            exit
+          fi
+          # The same release every time, its tag moved here: its download
+          # links stay the same
+          notes="Built from $GITHUB_SHA. It changes with every push to main."
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin nightly
+          if gh release view nightly --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload nightly dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit nightly --repo "$GITHUB_REPOSITORY" --notes "$notes"
+          else
+            gh release create nightly dist/* --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "Nightly" --notes "$notes"
+          fi
