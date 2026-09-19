@@ -55,3 +55,12 @@ wait_same "moved out"
 # Moved in: sent
 mv "$T/away" "$L/back"
 wait_same "moved in"
+
+# A synced folder replaced by another of the same name: what's in the new one
+# has no events of its own, and is sent all the same
+mkdir -p "$L/swap" && echo old >"$L/swap/old"
+wait_same "a folder to swap"
+mkdir -p "$T/other" && echo new >"$T/other/new"
+rm -r "$L/swap" && mv "$T/other" "$L/swap"
+wait_same "a folder swapped for another"
+expect_file "$R/swap/new" new

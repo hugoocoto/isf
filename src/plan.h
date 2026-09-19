@@ -23,9 +23,11 @@ typedef struct {
         char type; // 0 missing, 'f' file, 'd' directory, 'l' symlink, '?' other
         uint64_t size;
         uint32_t mtime;
-        uint32_t mode;  // permission bits
-        char *link;     // symlink target
-        uint64_t stamp; // local files only: ctime in ns, any change moves it
+        uint32_t mode;   // permission bits
+        char *link;      // symlink target
+        uint64_t stamp;  // local files: ctime in ns, any change moves it
+        int written;     // remote files: the agent said someone else wrote it since
+                         // the last flush (not recorded)
 } State;
 
 State state_copy(const State *st);
@@ -36,6 +38,9 @@ int same(const State *a, const State *b);
  * mtimes only have seconds, and an edit in the same second with the same
  * size would look the same. */
 int same_local(const State *l, const State *r);
+/* Did the remote file M change since R was recorded? Written by someone else,
+ * it did, even with the same size and mtime (SFTP's are whole seconds). */
+int same_remote(const State *m, const State *r);
 /* Same file, maybe apart from the mode? Then only the mode has to be sent. */
 int same_data(const State *a, const State *b);
 
@@ -60,7 +65,8 @@ typedef struct {
         int conflict; // COPY: both sides changed it, this one is the newest. The
                       // other file (not a symlink) is kept as FILE.isf-conflict
         int keep;     // MKDIR: the file in the way changed, keep it the same way
-        int quiet;    // MODE: part of making the directory, not reported
+        int quiet;    // not reported: MODE, part of making the directory; REMOVE,
+                      // of a temp file left by an interrupted transfer
 } Action;
 
 typedef Da(Action) Plan;

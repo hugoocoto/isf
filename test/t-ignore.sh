@@ -51,3 +51,16 @@ expect_missing "$R/later.txt"
 printf '*.log\n# remote\n' >"$R/.isfignore"
 echo x >"$R/r.txt"
 wait_for '[ -e "$L/r.txt" ] && [ -e "$R/later.txt" ]'
+
+# .isfignore edited here while isf wasn't running: sent when it starts, and
+# not taken back from what the remote had before
+wait_for 'cmp -s "$L/.isfignore" "$R/.isfignore"'
+settle # recorded
+stop
+printf '*.log\n# edited while stopped, and longer\n' >"$L/.isfignore"
+start
+wait_for 'grep -q "edited while stopped" "$R/.isfignore"'
+settle
+grep -q "edited while stopped" "$L/.isfignore" || fail "the edit was taken back"
+grep -q "↓ .isfignore" "$T/out" && fail "the edit came back as received"
+expect_out "in sync: 1 sent, 0 received"

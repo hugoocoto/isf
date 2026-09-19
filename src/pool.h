@@ -14,12 +14,17 @@
 void pool_start(int jobs, const char *host, const char *port, char *const *ssh_opts);
 int pool_enabled(void);
 
-/* Run RUN(CONN, WORKER, ARG) on a worker. WORKER is its number, from 1. */
-void pool_submit(void (*run)(Sftp *conn, int worker, void *arg), void *arg);
+/* Jobs a worker takes at once, at most */
+#define POOL_BATCH 64
 
-/* Wait for every job submitted, then call DONE(ARG) for each, on this thread.
+/* Run RUN(CONN, ARGS, N) on a worker, with ARG among ARGS: a worker takes the
+ * jobs waiting with the same RUN, up to POOL_BATCH, and runs them together. */
+void pool_submit(void (*run)(Sftp *conn, void **args, int n), void *arg);
+
+/* Wait for every job submitted, calling DONE(ARG) for each as it finishes, on
+ * this thread, and TICK (if not NULL) about every 200 ms while waiting.
  * Returns 1 if a worker's connection broke: the pool can't be used anymore. */
-int pool_drain(void (*done)(void *arg));
+int pool_drain(void (*done)(void *arg), void (*tick)(void));
 
 /* Stop the workers and close their connections */
 void pool_stop(void);

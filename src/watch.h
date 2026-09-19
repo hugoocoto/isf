@@ -29,4 +29,18 @@ void unwatch(const char *path, int fd);
 /* Read the events waiting on FD and call HANDLE for each. Returns 1 on error. */
 int handle_events(int fd, void (*handle)(const struct inotify_event *event, int fd));
 
+/* Files written to and not closed yet (a log): an IN_MODIFY without its
+ * IN_CLOSE_WRITE. Each is due once the writes to it stop for HELD_QUIET_MS,
+ * or HELD_MAX_MS after the first one if they don't. */
+#define HELD_QUIET_MS 2000
+#define HELD_MAX_MS 30000
+/* PATH, in folder ROOT, was written to */
+void held_write(const char *path, int root);
+/* PATH was closed after writing, removed or moved: that says it */
+void held_forget(const char *path);
+/* Milliseconds until the next one is due, -1 if none */
+int held_timeout(void);
+/* Call FN for each one due, and forget them */
+void held_due(void (*fn)(const char *path, int root));
+
 #endif // !WATCH_H_

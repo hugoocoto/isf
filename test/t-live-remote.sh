@@ -38,6 +38,14 @@ for i in $(seq 50); do echo "$i" >"$T/src/$i"; done
 cp -r "$T/src" "$R/copied"
 wait_same "tree copied in"
 
+# A tree received: the folders isf makes are watched right away, so what's
+# made in them just after is sent
+mkdir -p "$R/got/a/b"
+echo x >"$R/got/a/b/x"
+wait_for '[ -e "$L/got/a/b/x" ]'
+echo here >"$L/got/a/b/here"
+wait_same "made in a folder just received"
+
 # The remote folder removed: isf stops instead of deleting everything here
 rm -rf "$R"
 wait_for '! kill -0 $PID 2>/dev/null'

@@ -1,13 +1,16 @@
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #include "pool.h"
 #include "util.h"
 
 typedef struct {
-        void (*run)(Sftp *conn, int worker, void *arg);
+        void (*run)(Sftp *conn, void **args, int n);
         void *arg;
 } Job;
 
@@ -18,28 +21,51 @@ static struct {
         Sftp *conn;        // [jobs]
         pthread_t *thread; // [jobs]
         pthread_mutex_t mtx;
-        pthread_cond_t wake;  // a job is waiting, or stop
-        pthread_cond_t idle;  // pending reached 0
-        pthread_cond_t ready; // a worker finished connecting
-        Jobs queue;           // waiting
-        Jobs done;            // finished, for pool_drain
-        int pending;          // submitted, not finished yet
+        pthread_cond_t wake;     // a job is waiting, or stop
+        pthread_cond_t finished; // a batch of jobs finished
+        pthread_cond_t ready;    // a worker finished connecting
+        Jobs queue;              // waiting
+        Jobs done;               // finished, for pool_drain
+        int pending;             // submitted, not finished yet
         int stop;
         const char *host, *port;
         char *const *ssh_opts;
         int connected, failed; // workers that finished connecting
+        int starting;          // workers started, of JOBS: not waited for yet
 } pool;
+
+static void stop_workers(int n);
+
+/* The workers connect in the background: the first time the pool is needed,
+ * wait until they're done. If some couldn't, run synchronous rather than
+ * degraded. */
+static void
+pool_settle(void)
+{
+        if (!pool.starting) return;
+        int n = pool.starting > 0 ? pool.starting : 0;
+        pthread_mutex_lock(&pool.mtx);
+        while (pool.connected + pool.failed < n)
+                pthread_cond_wait(&pool.ready, &pool.mtx);
+        pthread_mutex_unlock(&pool.mtx);
+        pool.starting = 0;
+        if (n < pool.jobs || pool.failed) {
+                LOG_WARN("Using a single connection instead of %d", pool.jobs);
+                stop_workers(n); // and disabled
+        }
+}
 
 int
 pool_enabled(void)
 {
+        pool_settle();
         return pool.jobs >= 2;
 }
 
 static void *
 worker_main(void *arg)
 {
-        int id  = (int) (intptr_t) arg;
+        int id  = (int) (intptr_t) arg; // its connection
         Sftp *c = &pool.conn[id];
 
         /* Each worker opens its connection, all at once: a few round trips
@@ -63,19 +89,31 @@ worker_main(void *arg)
                         pthread_mutex_unlock(&pool.mtx);
                         return NULL;
                 }
-                Job j = pool.queue.items[--pool.queue.count];
+                /* The newest job, and the ones before it with the same run */
+                Job batch[POOL_BATCH];
+                void *args[POOL_BATCH];
+                int n = 0;
+                do {
+                        batch[n] = pool.queue.items[--pool.queue.count];
+                        args[n]  = batch[n].arg;
+                        n++;
+                } while (n < POOL_BATCH && pool.queue.count > 0 &&
+                         pool.queue.items[pool.queue.count - 1].run == batch[0].run);
                 pthread_mutex_unlock(&pool.mtx);
 
-                j.run(c, id + 1, j.arg); // no lock held: the connections are separate
+                batch[0].run(c, args, n); // no lock held: the connections are separate
 
                 pthread_mutex_lock(&pool.mtx);
-                Da_append(&pool.done, j);
-                if (--pool.pending == 0) pthread_cond_signal(&pool.idle);
+                for (int i = 0; i < n; i++)
+                        Da_append(&pool.done, batch[i]);
+                pool.pending -= n;
+                pthread_cond_signal(&pool.finished);
                 pthread_mutex_unlock(&pool.mtx);
         }
 }
 
-/* Stop and join the first N workers */
+/* Stop and join the first N workers, close their connections, and forget
+ * it all: pool_start can start it again */
 static void
 stop_workers(int n)
 {
@@ -87,6 +125,15 @@ stop_workers(int n)
                 pthread_join(pool.thread[i], NULL);
                 sftp_disconnect(&pool.conn[i]);
         }
+        free(pool.conn);
+        free(pool.thread);
+        Da_destroy(&pool.queue);
+        Da_destroy(&pool.done);
+        pthread_mutex_destroy(&pool.mtx);
+        pthread_cond_destroy(&pool.wake);
+        pthread_cond_destroy(&pool.finished);
+        pthread_cond_destroy(&pool.ready);
+        memset(&pool, 0, sizeof pool);
 }
 
 void
@@ -99,7 +146,7 @@ pool_start(int jobs, const char *host, const char *port, char *const *ssh_opts)
         assert(pool.conn && pool.thread);
         pthread_mutex_init(&pool.mtx, NULL);
         pthread_cond_init(&pool.wake, NULL);
-        pthread_cond_init(&pool.idle, NULL);
+        pthread_cond_init(&pool.finished, NULL);
         pthread_cond_init(&pool.ready, NULL);
         pool.host     = host;
         pool.port     = port;
@@ -112,24 +159,13 @@ pool_start(int jobs, const char *host, const char *port, char *const *ssh_opts)
                         break;
                 }
         }
-        pthread_mutex_lock(&pool.mtx);
-        while (pool.connected + pool.failed < n)
-                pthread_cond_wait(&pool.ready, &pool.mtx);
-        pthread_mutex_unlock(&pool.mtx);
-
-        if (n < jobs || pool.failed) {
-                /* Couldn't open all of them: run synchronous rather than degraded */
-                LOG_WARN("Using a single connection instead of %d", jobs);
-                stop_workers(n);
-                free(pool.conn);
-                free(pool.thread);
-                pool.conn = NULL;
-                pool.jobs = 1; // disabled
-        }
+        /* They connect while the rest starts: see pool_settle */
+        pool.starting = n ? n : -1;
+        if (n == 0) pool_settle();
 }
 
 void
-pool_submit(void (*run)(Sftp *conn, int worker, void *arg), void *arg)
+pool_submit(void (*run)(Sftp *conn, void **args, int n), void *arg)
 {
         pthread_mutex_lock(&pool.mtx);
         Da_append(&pool.queue, (Job) { run, arg });
@@ -139,22 +175,36 @@ pool_submit(void (*run)(Sftp *conn, int worker, void *arg), void *arg)
 }
 
 int
-pool_drain(void (*done)(void *arg))
+pool_drain(void (*done)(void *arg), void (*tick)(void))
 {
         if (!pool_enabled()) return 0;
 
         pthread_mutex_lock(&pool.mtx);
-        while (pool.pending > 0)
-                pthread_cond_wait(&pool.idle, &pool.mtx);
-        Jobs finished = pool.done;
-        pool.done     = (Jobs) { 0 };
-        pthread_mutex_unlock(&pool.mtx);
+        for (;;) {
+                Jobs finished = pool.done;
+                pool.done     = (Jobs) { 0 };
+                int left      = pool.pending;
+                pthread_mutex_unlock(&pool.mtx);
 
-        Da_foreach(j, finished)
-        {
-                done(j->arg);
+                Da_foreach(j, finished)
+                {
+                        done(j->arg);
+                }
+                Da_destroy(&finished);
+                if (left == 0) break;
+                if (tick) tick();
+
+                pthread_mutex_lock(&pool.mtx);
+                struct timespec until;
+                clock_gettime(CLOCK_REALTIME, &until);
+                until.tv_nsec += 200 * 1000000; // then TICK again
+                if (until.tv_nsec >= 1000000000) {
+                        until.tv_sec++;
+                        until.tv_nsec -= 1000000000;
+                }
+                while (pool.done.count == 0 && pool.pending > 0)
+                        if (pthread_cond_timedwait(&pool.finished, &pool.mtx, &until) == ETIMEDOUT) break;
         }
-        Da_destroy(&finished);
 
         for (int i = 0; i < pool.jobs; i++)
                 if (pool.conn[i].dead) return 1;

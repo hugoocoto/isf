@@ -1,5 +1,7 @@
 #include <assert.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +11,54 @@
 #include "util.h"
 
 int verbose;
+int log_errors;
+
+/* The terminal: what's said, and the status line under it */
+static struct {
+        pthread_mutex_t mtx;
+        char text[160]; // the status line, if not empty
+        int shown;      // it's on the screen
+        int tty;        // stdout is a terminal: 1, 0, or -1 not known yet
+} term = { .mtx = PTHREAD_MUTEX_INITIALIZER, .tty = -1 };
+
+/* With term.mtx held */
+static void
+status_draw(void)
+{
+        if (term.shown) fputs("\r\033[K", stdout); // back to the start, cleared
+        term.shown = *term.text != 0;
+        if (term.shown) fputs(term.text, stdout);
+        fflush(stdout);
+}
+
+void
+say(FILE *f, const char *fmt, ...)
+{
+        va_list ap;
+        va_start(ap, fmt);
+        pthread_mutex_lock(&term.mtx);
+        if (term.shown) {
+                fputs("\r\033[K", stdout);
+                fflush(stdout);
+                term.shown = 0;
+        }
+        vfprintf(f, fmt, ap);
+        if (*term.text) status_draw();
+        pthread_mutex_unlock(&term.mtx);
+        va_end(ap);
+}
+
+void
+status_line(const char *text)
+{
+        pthread_mutex_lock(&term.mtx);
+        if (term.tty == -1) term.tty = isatty(STDOUT_FILENO);
+        if (term.tty) {
+                snprintf(term.text, sizeof term.text, "%s", text ? text : "");
+                status_draw();
+        }
+        pthread_mutex_unlock(&term.mtx);
+}
 
 const char *
 pathjoin(const char *dir, const char *base)
@@ -112,10 +162,12 @@ name_safe(const char *name)
 }
 
 const char *
-temp_path(const char *dir, int worker)
+temp_path(const char *dir)
 {
-        char name[40];
-        snprintf(name, sizeof name, ".isf.%ld.%d.tmp", (long) getpid(), worker);
+        static unsigned count; // shared by the transfer threads
+        unsigned n = __atomic_fetch_add(&count, 1, __ATOMIC_RELAXED);
+        char name[48];
+        snprintf(name, sizeof name, ".isf.%ld.%u.tmp", (long) getpid(), n);
         return pathjoin(dir, name);
 }
 

@@ -10,6 +10,7 @@ T=$(mktemp -d "${TMPDIR:-/tmp}/isf-test.XXXXXX")
 L=$T/local/proj
 R=$T/home/proj
 PID=
+WAIT=${WAIT:-10} # how long the waits (start, wait_same, wait_for) wait, in seconds
 
 mkdir -p "$T/bin" "$T/local" "$T/home" "$T/state" "$L"
 ln -s "$TOP/test/fake-ssh" "$T/bin/ssh"
@@ -51,7 +52,8 @@ start() {
         # Its own process group, so stop() gets the ssh children too
         (cd "$T/local" && exec setsid "$ISF" "$@" -I "$ISF" >"$T/out" 2>"$T/err") &
         PID=$!
-        for _ in $(seq 200); do
+        local end=$((SECONDS + WAIT))
+        while [ $SECONDS -lt $end ]; do
                 grep -q "watching for changes" "$T/out" && return 0
                 kill -0 "$PID" 2>/dev/null || { PID=; fail "isf exited: $*"; }
                 sleep 0.05
@@ -93,9 +95,11 @@ tree() {
         } | LC_ALL=C sort)
 }
 
-# Wait until $L and $R have the same (up to 10 s)
+
+# Wait until $L and $R have the same
 wait_same() {
-        for _ in $(seq 200); do
+        local end=$((SECONDS + WAIT))
+        while [ $SECONDS -lt $end ]; do
                 [ "$(tree "$L")" = "$(tree "$R")" ] && return 0
                 sleep 0.05
         done
@@ -103,9 +107,10 @@ wait_same() {
         fail "local and remote differ${1:+: $1}"
 }
 
-# Wait until COMMAND succeeds (up to 10 s)
+# Wait until COMMAND succeeds
 wait_for() {
-        for _ in $(seq 200); do
+        local end=$((SECONDS + WAIT))
+        while [ $SECONDS -lt $end ]; do
                 eval "$1" && return 0
                 sleep 0.05
         done
@@ -115,6 +120,38 @@ wait_for() {
 # Changes are sent after 100 ms without events: give the side that is
 # expected to stay the same time to (wrongly) change
 settle() { sleep 0.5; }
+
+# Count SFTP requests: after this, `requests TYPE` sums TYPE (MKDIR, OPENDIR,
+# rounds...) over every connection, since the start or the last
+# `requests_clear`, and `main_requests TYPE` counts it on the main connection
+# only: the first one opened since then
+count_requests() { export ISF_TEST_SFTP_LOG=$T/sftp-log; }
+_count() { # FILE TYPE: its count in FILE, 0 if none
+        { [ -f "$1" ] && tr ' ' '\n' <"$1"; } | awk -F= -v k="$2" '$1 == k { n = $2 } END { print n + 0 }'
+}
+requests() {
+        local n=0 f
+        for f in "$T"/sftp-log.*; do
+                [ -e "$f" ] || continue
+                n=$((n + $(_count "$f" "$1") - $(_count "$T/sftp-base.${f##*.}" "$1")))
+        done
+        echo $n
+}
+main_requests() {
+        local f
+        for f in "$T"/sftp-log.*; do
+                [ -e "$f" ] && [ ! -e "$T/sftp-base.${f##*.}" ] || continue
+                echo "$(_count "$f" start) $(_count "$f" "$1")"
+        done | sort -n | head -1 | cut -d' ' -f2
+}
+# Each relay keeps its totals: clearing is taking them as the baseline
+requests_clear() {
+        local f
+        for f in "$T"/sftp-log.*; do
+                [ -e "$f" ] && cp "$f" "$T/sftp-base.${f##*.}"
+        done
+        return 0
+}
 
 expect_out() { grep -qF -- "$1" "$T/out" || fail "output lacks '$1'"; }
 expect_err() { grep -qF -- "$1" "$T/err" || fail "errors lack '$1'"; }

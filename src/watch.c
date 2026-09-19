@@ -1,17 +1,101 @@
 #define _DEFAULT_SOURCE
 
+#include <assert.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "bt.h"
 #include "util.h"
 #include "watch.h"
 
 static Da(Watch) watches; // maps event->wd back to a path, sorted by wd
+
+typedef struct {
+        int root;
+        long first, last; // writes, in now_ms()
+} Held;
+static BT held; // path → Held
+
+static long
+now_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* When H is due */
+static long
+held_when(const Held *h)
+{
+        long quiet = h->last + HELD_QUIET_MS, most = h->first + HELD_MAX_MS;
+        return quiet < most ? quiet : most;
+}
+
+void
+held_write(const char *path, int root)
+{
+        long now = now_ms();
+        Held *h  = bt_get(&held, path);
+        if (h == NULL) {
+                h = malloc(sizeof *h);
+                assert(h);
+                *h = (Held) { .root = root, .first = now };
+                bt_add(&held, path, h);
+        }
+        h->last = now;
+}
+
+void
+held_forget(const char *path)
+{
+        Held *h = bt_get(&held, path);
+        if (h == NULL) return;
+        bt_del(&held, path);
+        free(h);
+}
+
+int
+held_timeout(void)
+{
+        long next = -1;
+        BT *n;
+        for_bt_each(n, &held)
+        {
+                long when = held_when(n->value);
+                if (next == -1 || when < next) next = when;
+        }
+        if (next == -1) return -1;
+        long wait = next - now_ms();
+        return wait < 0 ? 0 : (int) wait;
+}
+
+void
+held_due(void (*fn)(const char *path, int root))
+{
+        long now = now_ms();
+        Da(char *) due = { 0 };
+        BT *n;
+        for_bt_each(n, &held)
+        {
+                if (held_when(n->value) <= now) Da_append(&due, strdup(n->key));
+        }
+        Da_foreach(p, due)
+        {
+                Held *h  = bt_get(&held, *p);
+                int root = h->root;
+                held_forget(*p);
+                fn(*p, root);
+                free(*p);
+        }
+        Da_destroy(&due);
+}
 
 int
 watch_init(void)

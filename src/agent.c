@@ -1,10 +1,13 @@
 #define _DEFAULT_SOURCE
 
 #include <assert.h>
+#include <dirent.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -16,18 +19,61 @@
 static struct {
         Root *roots;
         int count;
+        /* The cookies of the last renames from isf's temp files: their
+         * MOVED_TO is isf writing a file */
+        uint32_t temp_moves[64];
+        int temp_count;
+        /* A MOVED_FROM waiting for its MOVED_TO: together they're a rename */
+        struct {
+                int active;
+                uint32_t cookie;
+                int root;
+                char *path;
+                int is_dir;
+        } move;
+        int fd; // inotify's
 } g;
 
-/* Tell the other side about a change */
-static void
-agent_send(char type, int root, const char *rel)
+/* Is COOKIE a rename from one of isf's temp files? (Forgotten then.) */
+static int
+temp_moved(uint32_t cookie)
 {
-        size_t len = strlen(rel) + 3;
+        for (int i = 0; i < 64 && i < g.temp_count; i++) {
+                if (g.temp_moves[i] == cookie && cookie) {
+                        g.temp_moves[i] = 0;
+                        return 1;
+                }
+        }
+        return 0;
+}
+
+/* ST as text: size, mtime and mode in hex. 32 characters and a NUL into BUF. */
+static void
+stat_text(const struct stat *st, char *buf)
+{
+        sprintf(buf, "%016llx%08x%08x", (unsigned long long) st->st_size, (unsigned) st->st_mtime, (unsigned) st->st_mode);
+}
+
+/* What lstat says of PATH, as text (all 0 if it's gone) */
+static void
+lstat_text(const char *path, char *buf)
+{
+        struct stat st;
+        if (lstat(path, &st) == -1) memset(&st, 0, sizeof st);
+        stat_text(&st, buf);
+}
+
+/* Tell the other side: TYPE, ROOT, VALUE and TEXT (see agent.h) */
+static void
+agent_send(char type, int root, uint64_t value, const char *text)
+{
+        size_t len = strlen(text) + 19;
         char *msg  = malloc(len);
         assert(msg);
         msg[0] = type;
         msg[1] = root;
-        memcpy(msg + 2, rel, len - 2);
+        snprintf(msg + 2, 17, "%016llx", (unsigned long long) value);
+        memcpy(msg + 18, text, len - 18);
         for (size_t done = 0; done < len;) {
                 ssize_t n = write(STDOUT_FILENO, msg + done, len - done);
                 if (n == -1 && errno == EINTR) continue;
@@ -37,13 +83,121 @@ agent_send(char type, int root, const char *rel)
         free(msg);
 }
 
+/* Report the change at PATH, in ROOT: KIND (see agent.h) and its lstat */
+static void
+agent_change(char kind, int root, const char *path)
+{
+        const char *rel = rel_path(g.roots[root].local, path);
+        char *text      = malloc(strlen(rel) + 33);
+        assert(text);
+        lstat_text(path, text);
+        strcat(text, rel);
+        agent_send(kind, root, 0, text);
+        free(text);
+}
+
+/* The MOVED_FROM waiting got no MOVED_TO: it left the folders, which is a
+ * removal */
+static void
+move_flush(void)
+{
+        if (!g.move.active) return;
+        agent_change(g.move.is_dir ? 'D' : 'C', g.move.root, g.move.path);
+        /* Its watches would keep reporting it under the old path */
+        if (g.move.is_dir) unwatch(g.move.path, g.fd);
+        free(g.move.path);
+        g.move.active = 0;
+}
+
+/* Entries listed at the start, at most: past that, the other side lists the
+ * rest itself */
+#define LIST_MAX 100000
+/* A listing goes in messages of about this size */
+#define LIST_CHUNK 65536
+
+static void
+append(CharBuf *b, const char *s, size_t n)
+{
+        for (size_t i = 0; i < n; i++)
+                Da_append(b, s[i]);
+}
+
+/* Send what's in PATH, a folder in ROOT_I, then do the same for the folders in
+ * it that aren't ignored, while *LEFT (entries) lasts: 'L' (see agent.h). Once
+ * everything is watched, so what changes after it's listed is reported. */
+static void
+list_folder(int root_i, const char *path, long *left)
+{
+        if (*left <= 0) return;
+        DIR *dir = opendir(path);
+        if (dir == NULL) return; // listed over SFTP then, which says why
+        const Root *root = &g.roots[root_i];
+        const char *rel  = rel_path(root->local, path);
+        char text[33];
+        CharBuf msg = { 0 };
+        lstat_text(path, text);
+        append(&msg, text, 32);
+        append(&msg, rel, strlen(rel));
+        size_t head = msg.count; // the same in each message
+        Da(char *) subdirs = { 0 };
+
+        struct dirent *e;
+        while ((e = readdir(dir))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+                char *child = (char *) pathjoin(path, e->d_name);
+                struct stat st;
+                if (lstat(child, &st) == -1) { // gone meanwhile
+                        free(child);
+                        continue;
+                }
+                size_t len = strlen(e->d_name);
+                if ((size_t) msg.count + 32 + len + 1 > LIST_CHUNK && (size_t) msg.count > head) {
+                        Da_append(&msg, 0);
+                        agent_send('L', root_i, strlen(rel), msg.items);
+                        msg.count = head;
+                }
+                stat_text(&st, text);
+                append(&msg, text, 32);
+                append(&msg, e->d_name, len);
+                Da_append(&msg, '/');
+                (*left)--;
+                if (S_ISDIR(st.st_mode) && !ignored(&root->ign, rel_path(root->local, child), 1))
+                        Da_append(&subdirs, child);
+                else
+                        free(child);
+        }
+        closedir(dir);
+        Da_append(&msg, 0);
+        agent_send('L', root_i, strlen(rel), msg.items);
+        Da_destroy(&msg);
+
+        Da_foreach(p, subdirs)
+        {
+                list_folder(root_i, *p, left);
+                free(*p);
+        }
+        Da_destroy(&subdirs);
+}
+
+/* A file written to without being closed (a log), now that the writes
+ * stopped for a while: someone else's write */
+static void
+held_remote(const char *path, int root)
+{
+        agent_change('C', root, path);
+}
+
 /* The agent's handle_event: report what changed, don't sync anything */
 static void
 agent_event(const struct inotify_event *event, int fd)
 {
+        /* A MOVED_FROM is followed by its MOVED_TO, if the thing stays in the
+         * folders. Anything else first: it left. */
+        if (g.move.active && !((event->mask & IN_MOVED_TO) && event->cookie == g.move.cookie)) move_flush();
+
         if (event->mask & IN_Q_OVERFLOW) {
                 for (int i = 0; i < g.count; i++)
-                        agent_send('O', i, "");
+                        agent_send('O', i, 0, "");
                 return;
         }
 
@@ -65,13 +219,46 @@ agent_event(const struct inotify_event *event, int fd)
                 }
                 return;
         }
-        if (is_temp_name(event->name)) return; // a transfer in progress
+        if (is_temp_name(event->name)) {
+                /* A transfer in progress: not said. Its rename into place is. */
+                if (event->mask & IN_MOVED_FROM) g.temp_moves[g.temp_count++ % 64] = event->cookie;
+                return;
+        }
 
         const char *path = pathjoin(w->path, event->name);
         if ((event->mask & (IN_CREATE | IN_MOVED_TO)) && (event->mask & IN_ISDIR))
                 listen_folder(path, root_i, fd);
-        if (event->mask & (IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO))
-                agent_send(event->mask & IN_ISDIR ? 'D' : 'C', root_i, rel_path(root->local, path));
+        /* Written to and not closed (a log): said once the writes stop */
+        if ((event->mask & IN_MODIFY) && !(event->mask & IN_ISDIR)) held_write(path, root_i);
+        if (event->mask & (IN_CLOSE_WRITE | IN_DELETE | IN_MOVED_FROM)) held_forget(path);
+        if (event->mask & IN_MOVED_FROM) {
+                /* Wait for its MOVED_TO */
+                g.move.active = 1;
+                g.move.cookie = event->cookie;
+                g.move.root   = root_i;
+                g.move.path   = strdup(path);
+                g.move.is_dir = (event->mask & IN_ISDIR) != 0;
+        } else if ((event->mask & IN_MOVED_TO) && g.move.active && g.move.root == root_i) {
+                /* A rename inside the folder: the other side can do the same */
+                const char *from = rel_path(root->local, g.move.path);
+                const char *to   = rel_path(root->local, path);
+                char *text       = malloc(strlen(from) + strlen(to) + 33);
+                assert(text);
+                lstat_text(path, text);
+                strcat(strcat(text, from), to);
+                agent_send('M', root_i, strlen(from), text);
+                free(text);
+                free(g.move.path);
+                g.move.active = 0;
+        } else if (event->mask & (IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_TO)) {
+                /* Who wrote it matters: a write by someone else changes it,
+                 * whatever its size and mtime (whole seconds) say */
+                char kind = event->mask & IN_ISDIR                                   ? 'D' :
+                            event->mask & IN_MOVED_TO && temp_moved(event->cookie) ? 'W' :
+                            event->mask & IN_ATTRIB                                  ? 'A' :
+                                                                                       'C';
+                agent_change(kind, root_i, path);
+        }
         free((void *) path);
 }
 
@@ -83,21 +270,43 @@ agent_main(Root *roots, int count)
 
         int fd = watch_init();
         if (fd < 0) return 1;
+        g.fd = fd;
         for (int i = 0; i < count; i++) {
+                /* Made if missing: the first sync of a folder there */
+                if (mkdir_p(roots[i].local) == -1) {
+                        LOG_ERR("Cannot create '%s'", roots[i].local);
+                        return 1;
+                }
                 if (listen_folder(roots[i].local, i, fd)) return 1;
         }
-        agent_send('R', 0, "");
+        /* What's there now, for the first walk of the other side. Not what
+         * its .isfignore here ignores: the other side lists that itself, if
+         * its own .isfignore doesn't. */
+        long left = LIST_MAX;
+        for (int i = 0; i < count; i++) {
+                ignore_load(&roots[i].ign, roots[i].local);
+                list_folder(i, roots[i].local, &left);
+        }
+        agent_send('R', 0, AGENT_PROTOCOL, VERSION);
 
         struct pollfd fds[] = {
                 { .fd = fd, .events = POLLIN },
                 { .fd = STDIN_FILENO, .events = POLLIN },
         };
         for (;;) {
-                if (poll(fds, 2, -1) == -1) {
+                /* A MOVED_FROM waits for its MOVED_TO only so long, and a
+                 * file held open until it's due */
+                int wait     = g.move.active ? 50 : -1;
+                int held     = held_timeout();
+                int for_held = held >= 0 && (wait < 0 || held < wait);
+                int n        = poll(fds, 2, for_held ? held : wait);
+                if (n == -1) {
                         if (errno == EINTR) continue;
                         LOG_ERR("poll");
                         return 1;
                 }
+                if (n == 0 && !for_held) move_flush();
+                held_due(held_remote);
                 if (fds[1].revents) return 0;
                 if ((fds[0].revents & POLLIN) && handle_events(fd, agent_event)) return 1;
         }
@@ -155,27 +364,123 @@ agent_start(Agent *a, const char *isf, const char *host, const char *port,
         return 0;
 }
 
-int
-agent_read(Agent *a, void (*handle)(char type, int root, const char *rel))
+/* The N hex digits at S, into *V. Returns 0 if they aren't. */
+static int
+hex(const char *s, int n, uint64_t *v)
 {
-        char chunk[4096];
+        *v = 0;
+        for (int i = 0; i < n; i++) {
+                int c = s[i];
+                int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+                if (d < 0) return 0;
+                *v = *v << 4 | d;
+        }
+        return 1;
+}
+
+/* What lstat_text wrote at S, 32 hex digits */
+static int
+lstat_parse(const char *s, uint64_t *size, uint64_t *mtime, uint64_t *mode)
+{
+        return hex(s, 16, size) && hex(s + 16, 8, mtime) && hex(s + 24, 8, mode);
+}
+
+/* An 'L' message: TEXT (to NUL) is the folder's lstat and its path, LEN long,
+ * then each entry's lstat, its name and a '/'. A damaged one goes to LISTED
+ * with no DIR: some of the entries would look deleted. */
+static void
+read_listing(int root, uint64_t len, const char *text, const char *nul,
+             void (*listed)(int root, const char *rel, const SftpAttrs *self, SftpDir *dir))
+{
+        uint64_t size, mtime, mode;
+        const char *p = text + 32;
+        if (nul - text < 32 || !lstat_parse(text, &size, &mtime, &mode) || len > (uint64_t) (nul - p)) {
+                listed(root, "", NULL, NULL);
+                return;
+        }
+        const SftpAttrs self = { .flags = SFTP_ATTR_SIZE | SFTP_ATTR_PERMISSIONS | SFTP_ATTR_ACMODTIME,
+                                 .size  = size,
+                                 .perm  = mode,
+                                 .mtime = mtime };
+        char *rel   = strndup(p, len);
+        SftpDir dir = { 0 };
+        int ok      = 1;
+        for (p += len; ok && p < nul;) {
+                const char *end = nul - p > 32 ? memchr(p + 32, '/', nul - p - 32) : NULL;
+                ok              = end != NULL && lstat_parse(p, &size, &mtime, &mode);
+                if (!ok) break;
+                SftpEntry e = { .name  = strndup(p + 32, end - p - 32),
+                                .attrs = { .flags = self.flags, .size = size, .perm = mode, .mtime = mtime } };
+                Da_append(&dir, e);
+                p = end + 1;
+        }
+        if (ok) {
+                listed(root, rel, &self, &dir);
+        } else {
+                sftp_dir_free(&dir);
+                listed(root, rel, NULL, NULL);
+        }
+        free(rel);
+}
+
+int
+agent_read(Agent *a, void (*handle)(char type, int root, const char *rel, const State *seen),
+           void (*moved)(int root, const char *from, const char *to, const State *seen),
+           void (*listed)(int root, const char *rel, const SftpAttrs *self, SftpDir *dir))
+{
+        char chunk[65536];
         ssize_t n = read(a->from, chunk, sizeof chunk);
         if (n == -1 && errno == EINTR) return 0;
         if (n <= 0) return 1;
         for (ssize_t i = 0; i < n; i++)
                 Da_append(&a->buf, chunk[i]);
 
-        /* A message is type, root, path and NUL: at least 3 bytes */
+        /* A message is type, root, text and NUL: at least 3 bytes. The text
+         * starts with the number, but not in protocol 1. */
         char *b      = a->buf.items;
         size_t start = 0, count = a->buf.count;
         while (count - start >= 3) {
                 char *nul = memchr(b + start + 2, 0, count - start - 2);
                 if (nul == NULL) break;
-                if (b[start] == 'R')
-                        a->ready = 1;
-                else
-                        handle(b[start], (unsigned char) b[start + 1], b + start + 2);
-                start = nul - b + 1;
+                char type        = b[start];
+                int root         = (unsigned char) b[start + 1];
+                const char *text = b + start + 2;
+                uint64_t value   = 0;
+                int numbered     = nul - text >= 16 && hex(text, 16, &value);
+                start            = nul - b + 1;
+
+                if (type == 'R') {
+                        a->ready    = 1;
+                        a->protocol = numbered ? (int) value : 1;
+                        free(a->version);
+                        a->version = numbered ? strdup(text + 16) : NULL;
+                } else if (type == 'L' && numbered) { // before 'R', which says the protocol
+                        read_listing(root, value, text + 16, nul, listed);
+                } else if (a->protocol < 2) {
+                        handle(type, root, text, NULL);
+                } else if (numbered && strchr("CWADM", type)) {
+                        /* What it is now, from its lstat */
+                        uint64_t size, mtime, mode;
+                        if (nul - text < 48 || !lstat_parse(text + 16, &size, &mtime, &mode)) continue;
+                        State seen = {
+                                .type  = !mode ? 0 : S_ISREG(mode) ? 'f' : S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '?',
+                                .size  = size,
+                                .mtime = mtime,
+                                .mode  = mode & 07777,
+                        };
+                        if (type != 'M') {
+                                handle(type, root, text + 48, &seen);
+                                continue;
+                        }
+                        /* The old path (VALUE long), then the new one */
+                        const char *paths = text + 48;
+                        if (value > (uint64_t) (nul - paths)) continue;
+                        char *from = strndup(paths, value);
+                        moved(root, from, paths + value, &seen);
+                        free(from);
+                } else if (numbered) {
+                        handle(type, root, text + 16, NULL);
+                }
         }
         memmove(b, b + start, count - start);
         a->buf.count = count - start;
@@ -191,6 +496,7 @@ agent_stop(Agent *a)
         if (a->pid > 0 && waitpid(a->pid, &status, 0) > 0)
                 status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         Da_destroy(&a->buf);
+        free(a->version);
         *a = (Agent) { .pid = -1, .to = -1, .from = -1 };
         return status;
 }

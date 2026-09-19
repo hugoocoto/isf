@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "agent.h"
 #include "ignore.h"
 #include "plan.h"
 #include "util.h"
@@ -152,6 +153,15 @@ test_plan(void)
         CHECK(plans(f1, f1x, f1, SYNC_DATA, ACT_ATTRS, 0, 0));         // chmod there
         CHECK(plans(f1t, f2, f1, SYNC_ATTR, ACT_COPY, 0, 1));          // a conflict is never just attributes
 
+        /* Written there by someone else, as the agent said: changed, whatever
+         * size and mtime say */
+        State w1 = f1, w1x = f1x;
+        w1.written = w1x.written = 1;
+        CHECK(plans(f1, w1, f1, SYNC_DATA, ACT_COPY, 0, 0));   // same size and mtime: the content
+        CHECK(plans(f1, w1x, f1, SYNC_DATA, ACT_ATTRS, 0, 0)); // another mode: a chmod
+        CHECK(plans(f2, w1, f1, SYNC_DATA, ACT_COPY, 1, 1));   // written on both sides: a conflict
+        CHECK(same_remote(&f1, &f1) && !same_remote(&w1, &f1));
+
         State d1 = dir(0755), d2 = dir(0700);
         CHECK(decide_dir(&d1, &d1, &d1) == DIR_BOTH);
         CHECK(decide_dir(&d1, &none, &d1) == DIR_GONE);     // deleted there
@@ -169,12 +179,144 @@ test_plan(void)
         CHECK(dir_mode(&d1, &d2, &none, &mode, &up) && up && mode == 0755); // new: here wins
 }
 
+/* What agent_read passed on, for test_agent_read */
+static struct {
+        int listings, damaged;
+        char *rels;   // the paths listed, each followed by a ';'
+        SftpDir dir;  // every entry, in order
+        SftpAttrs self;
+} got;
+
+static void
+got_listed(int root, const char *rel, const SftpAttrs *self, SftpDir *dir)
+{
+        (void) root;
+        if (dir == NULL) {
+                got.damaged++;
+                return;
+        }
+        got.listings++;
+        got.self      = *self;
+        size_t n      = got.rels ? strlen(got.rels) : 0;
+        got.rels      = realloc(got.rels, n + strlen(rel) + 2);
+        got.rels[n]   = 0;
+        strcat(strcat(got.rels, rel), ";");
+        Da_foreach(e, *dir)
+        {
+                Da_append(&got.dir, *e);
+        }
+        Da_destroy(dir);
+}
+
+static void
+got_change(char type, int root, const char *rel, const State *seen)
+{
+        (void) type, (void) root, (void) rel, (void) seen;
+}
+
+static void
+got_moved(int root, const char *from, const char *to, const State *seen)
+{
+        (void) root, (void) from, (void) to, (void) seen;
+}
+
+/* Write a message as the agent does: TYPE, root 0, VALUE, TEXT and a NUL */
+static void
+send_message(int fd, char type, uint64_t value, const char *text)
+{
+        char head[19];
+        head[0] = type;
+        head[1] = 0;
+        snprintf(head + 2, sizeof head - 2, "%016llx", (unsigned long long) value);
+        CHECK(write(fd, head, 18) == 18);
+        CHECK(write(fd, text, strlen(text) + 1) == (ssize_t) strlen(text) + 1);
+}
+
+/* Read MESSAGES (a function writing them) until 'R', into got */
+static void
+read_messages(void (*messages)(int fd))
+{
+        free(got.rels);
+        sftp_dir_free(&got.dir);
+        memset(&got, 0, sizeof got);
+        int p[2];
+        CHECK(pipe(p) == 0);
+        messages(p[1]);
+        send_message(p[1], 'R', AGENT_PROTOCOL, VERSION);
+        close(p[1]);
+        Agent a = { .pid = -1, .to = -1, .from = p[0] };
+        while (!a.ready && !agent_read(&a, got_change, got_moved, got_listed))
+                ;
+        CHECK(a.ready);
+        close(p[0]);
+        Da_destroy(&a.buf);
+        free(a.version);
+}
+
+#define LS_FILE "0000000000000005" "00000064" "000081a4" // 5 bytes, mtime 100, 0644
+#define LS_DIR "0000000000001000" "00000064" "000041ed"  // a directory, 0755
+
+static void
+good_listings(int fd)
+{
+        send_message(fd, 'L', 0, LS_DIR "" LS_FILE "x/" LS_DIR "a/");
+        /* A folder in two messages, and a name with a newline */
+        send_message(fd, 'L', 1, LS_DIR "a" LS_FILE "y/");
+        send_message(fd, 'L', 1, LS_DIR "a" LS_FILE "z\n/" LS_DIR "w/");
+}
+
+static void
+unterminated_name(int fd)
+{
+        send_message(fd, 'L', 1, LS_DIR "a" LS_FILE "y/" LS_FILE "z");
+}
+
+static void
+bad_digit(int fd)
+{
+        send_message(fd, 'L', 0, LS_DIR "" "000000000000000g" "00000064" "000081a4" "x/");
+}
+
+static void
+path_too_long(int fd)
+{
+        send_message(fd, 'L', 99, LS_DIR "a");
+}
+
+static void
+test_agent_read(void)
+{
+        read_messages(good_listings);
+        CHECK(got.listings == 3 && got.damaged == 0);
+        CHECK(got.rels && !strcmp(got.rels, ";a;a;"));
+        CHECK(got.dir.count == 5);
+        if (got.dir.count == 5) {
+                const SftpEntry *e = got.dir.items;
+                CHECK(!strcmp(e[0].name, "x") && e[0].attrs.size == 5 && e[0].attrs.mtime == 100 &&
+                      e[0].attrs.perm == 0100644);
+                CHECK(!strcmp(e[1].name, "a") && e[1].attrs.perm == 040755);
+                CHECK(!strcmp(e[2].name, "y") && !strcmp(e[3].name, "z\n") && !strcmp(e[4].name, "w"));
+        }
+        CHECK(got.self.perm == 040755 && got.self.size == 0x1000);
+
+        /* Damaged: said so, never passed on as a shorter listing */
+        read_messages(unterminated_name);
+        CHECK(got.listings == 0 && got.damaged == 1);
+        read_messages(bad_digit);
+        CHECK(got.listings == 0 && got.damaged == 1);
+        read_messages(path_too_long);
+        CHECK(got.listings == 0 && got.damaged == 1);
+        free(got.rels);
+        sftp_dir_free(&got.dir);
+}
+
 int
 main(void)
 {
         test_paths();
         test_ignore();
         test_plan();
+        test_agent_read();
         if (failed) return 1;
         printf("unit: ok\n");
         return 0;

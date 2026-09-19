@@ -15,6 +15,8 @@
 
 #include "sftp.h"
 
+uint64_t sftp_moved;
+
 #define SFTP_VERSION 3
 
 /* Largest packet we accept, same limit as OpenSSH's sftp-server */
@@ -75,11 +77,7 @@ typedef struct {
         int bad;
 } Reader;
 
-/* An open remote file or directory */
-typedef struct {
-        char data[256]; // the spec caps handles at 256 bytes
-        uint32_t len;
-} Handle;
+typedef SftpHandle Handle;
 
 __attribute__((format(printf, 3, 4))) static int
 fail(Sftp *s, int status, const char *fmt, ...)
@@ -273,6 +271,7 @@ packet_begin(Sftp *s, uint8_t type)
 static int
 packet_send(Sftp *s)
 {
+        if (s->dead) return SFTP_ERR_IO; // s->error still says why
         uint32_t len     = s->buf.count - 4;
         unsigned char *p = s->buf.items;
         p[0]             = len >> 24;
@@ -289,6 +288,7 @@ packet_send(Sftp *s)
 static int
 recv_raw(Sftp *s)
 {
+        if (s->dead) return SFTP_ERR_IO;
         unsigned char hdr[4];
         if (read_all(s->from, hdr, sizeof hdr)) goto read_error;
 
@@ -908,9 +908,11 @@ sftp_get(Sftp *s, const char *path, int fd)
         return st ? st : cst;
 }
 
-/* Parse the entries of one FXP_NAME reply into DIR (without "." and ".."). */
+/* Parse the entries of one FXP_NAME reply into DIR (without "." and "..").
+ * SELF, if not NULL, gets the attributes of ".", the directory itself, if
+ * the server sent it (then *FOUND is set). */
 static int
-parse_names(Sftp *s, Reader *r, SftpDir *dir)
+parse_names(Sftp *s, Reader *r, SftpDir *dir, SftpAttrs *self, int *found)
 {
         for (uint32_t n = get_u32(r); n > 0 && !r->bad; n--) {
                 uint32_t len, longname_len;
@@ -919,6 +921,10 @@ parse_names(Sftp *s, Reader *r, SftpDir *dir)
                 SftpAttrs attrs;
                 get_attrs(r, &attrs);
                 if (r->bad) break;
+                if (len == 1 && name[0] == '.' && self) {
+                        *self  = attrs;
+                        *found = 1;
+                }
                 if ((len == 1 && name[0] == '.') || (len == 2 && !memcmp(name, "..", 2)))
                         continue;
                 Da_append(dir, (SftpEntry) { .name = strndup(name, len), .attrs = attrs });
@@ -1022,7 +1028,7 @@ readdir_batch(Sftp *s, char *const *paths, int n, SftpDir *out, int *status)
                                         if (rs != SFTP_EOF && !eof[i]) status[i] = rs ? rs : SFTP_FAILURE;
                                         eof[i] = 1;
                                 } else if (!eof[i]) {
-                                        if ((st = parse_names(s, &r, &out[i]))) goto done;
+                                        if ((st = parse_names(s, &r, &out[i], NULL, NULL))) goto done;
                                 }
                         }
                 }
@@ -1067,6 +1073,13 @@ sftp_readdir_many(Sftp *s, char *const *paths, int n, SftpDir *out, int *status)
 int
 sftp_readdir(Sftp *s, const char *path, SftpDir *dir)
 {
+        return sftp_readdir_self(s, path, dir, NULL, NULL);
+}
+
+int
+sftp_readdir_self(Sftp *s, const char *path, SftpDir *dir, SftpAttrs *self, int *found)
+{
+        if (found) *found = 0;
         uint32_t id = request_begin(s, FXP_OPENDIR);
         put_str(s, path);
 
@@ -1110,7 +1123,7 @@ sftp_readdir(Sftp *s, const char *path, SftpDir *dir)
                                 continue; // drain the rest of the batch (also EOF)
                         }
                         if (eof) continue; // extra page after EOF: can't happen, but be safe
-                        if ((st = parse_names(s, &r, dir))) return st;
+                        if ((st = parse_names(s, &r, dir, self, found))) return st;
                 }
         }
         if (st == SFTP_ERR_IO) return st;
@@ -1127,6 +1140,386 @@ sftp_dir_free(SftpDir *dir)
                 free(e->name);
         }
         Da_destroy(dir);
+}
+
+/* ---- several files at once ------------------------------------------------
+ * sftp_put_many and sftp_get_many move a batch of files, the requests of all
+ * of them in flight together as far as the limits allow: a batch of small
+ * files takes about the round trips of one. The server answers in order, so
+ * a queue of what was asked tells what each reply is for. */
+
+/* In flight at most: requests, and bytes of WRITEs and READs, so what the
+ * server holds for us stays small. Small files fit many at once; a big one
+ * streams in SFTP_MAX_INFLIGHT pieces of SFTP_WRITE_LEN. */
+#define MANY_REQUESTS 256
+#define MANY_DATA (SFTP_MAX_INFLIGHT * SFTP_WRITE_LEN)
+
+enum { F_OPEN, F_OPENING, F_DATA, F_CLOSING, F_RENAMING, F_DONE };
+enum { Q_OPEN, Q_WRITE, Q_READ, Q_SETSTAT, Q_CLOSE, Q_LSTAT, Q_RENAME, Q_REMOVE };
+
+typedef struct {
+        uint32_t id;
+        int file, kind;
+        uint64_t offset; // READ
+        uint32_t len;    // READ
+} Asked;
+
+typedef struct {
+        Sftp *s;
+        SftpFile *f;
+        int n, up;
+        Asked q[MANY_REQUESTS]; // in flight, oldest at HEAD
+        int head, count;
+        int data; // bytes of the WRITEs and READs in flight
+} Many;
+
+/* The first failure of a file is the one said: its status, where, and the
+ * connection's message about it */
+static void
+file_fail(Sftp *s, SftpFile *f, int status, int at)
+{
+        if (f->status != SFTP_OK) return;
+        f->status = status ? status : SFTP_FAILURE;
+        f->at     = at;
+        snprintf(f->error, sizeof f->error, "%s", status == SFTP_CHANGED ? "changed meanwhile" : s->error);
+}
+
+/* Send the request built in s->buf, of KIND, for file I */
+static int
+many_send(Many *m, uint32_t id, int i, int kind, uint64_t offset, uint32_t len)
+{
+        int st = packet_send(m->s);
+        if (st) return st;
+        m->q[(m->head + m->count++) % MANY_REQUESTS] = (Asked) { id, i, kind, offset, len };
+        if (kind == Q_WRITE || kind == Q_READ) m->data += len;
+        if (kind == Q_READ) m->f[i].reads++;
+        m->f[i].waiting++;
+        return SFTP_OK;
+}
+
+static int
+has_room(const Many *m, int requests, int data)
+{
+        return m->count + requests <= MANY_REQUESTS && m->data + data <= MANY_DATA;
+}
+
+/* Put: WRITEs from its fd, then, written, the attributes, the CLOSE and the
+ * check of TARGET, all together */
+static int
+put_data(Many *m, int i)
+{
+        SftpFile *f = &m->f[i];
+        Sftp *s     = m->s;
+        char chunk[SFTP_WRITE_LEN];
+        for (;;) {
+                /* The next piece, as far as its size says: past it, only
+                 * the read that finds the end (unless it grew) */
+                uint64_t left = f->size > f->offset ? f->size - f->offset : 1;
+                size_t want   = left < sizeof chunk ? left : sizeof chunk;
+                if (f->status != SFTP_OK || f->eof || !has_room(m, 1, want)) break;
+                ssize_t n = read(f->fd, chunk, f->size > f->offset ? want : sizeof chunk);
+                if (n == -1 && errno == EINTR) continue;
+                if (n == -1) {
+                        fail(s, SFTP_FAILURE, "read: %s", strerror(errno));
+                        file_fail(s, f, SFTP_FAILURE, SFTP_AT_WRITE);
+                } else if (n == 0) {
+                        f->eof = 1;
+                } else {
+                        uint32_t id = request_begin(s, FXP_WRITE);
+                        put_handle(s, &f->h);
+                        put_u64(s, f->offset);
+                        put_u32(s, n);
+                        put(s, chunk, n);
+                        int st = many_send(m, id, i, Q_WRITE, 0, n);
+                        if (st) return st;
+                        f->offset += n;
+                }
+        }
+        if ((f->eof || f->status != SFTP_OK) && has_room(m, 3, 0)) {
+                int st;
+                uint32_t id;
+                if (f->status == SFTP_OK && f->attrs.flags) {
+                        id = request_begin(s, FXP_FSETSTAT);
+                        put_handle(s, &f->h);
+                        put_attrs(s, &f->attrs);
+                        if ((st = many_send(m, id, i, Q_SETSTAT, 0, 0))) return st;
+                }
+                id = request_begin(s, FXP_CLOSE);
+                put_handle(s, &f->h);
+                if ((st = many_send(m, id, i, Q_CLOSE, 0, 0))) return st;
+                if (f->status == SFTP_OK && f->expect != '-') {
+                        id = request_begin(s, FXP_LSTAT);
+                        put_str(s, f->target);
+                        if ((st = many_send(m, id, i, Q_LSTAT, 0, 0))) return st;
+                }
+                f->state = F_CLOSING;
+        }
+        return SFTP_OK;
+}
+
+/* Get: READs up to its size (a short one asked again), then, all read, the
+ * CLOSE, whose answer doesn't matter */
+static int
+get_data(Many *m, int i)
+{
+        SftpFile *f = &m->f[i];
+        Sftp *s     = m->s;
+        while (f->status == SFTP_OK && (f->retry_len || f->offset < f->size)) {
+                uint64_t offset = f->retry_len ? f->retry_offset : f->offset;
+                uint32_t len    = f->retry_len ? f->retry_len : (uint32_t) (f->size - f->offset < SFTP_WRITE_LEN ? f->size - f->offset : SFTP_WRITE_LEN);
+                if (!has_room(m, 1, len)) break;
+                if (f->retry_len)
+                        f->retry_len = 0;
+                else
+                        f->offset += len;
+                uint32_t id = request_begin(s, FXP_READ);
+                put_handle(s, &f->h);
+                put_u64(s, offset);
+                put_u32(s, len);
+                int st = many_send(m, id, i, Q_READ, offset, len);
+                if (st) return st;
+        }
+        if (f->reads == 0 && !f->retry_len && (f->status != SFTP_OK || f->offset >= f->size) && has_room(m, 1, 0)) {
+                uint32_t id = request_begin(s, FXP_CLOSE);
+                put_handle(s, &f->h);
+                int st = many_send(m, id, i, Q_CLOSE, 0, 0);
+                if (st) return st;
+                f->state = F_DONE;
+        }
+        return SFTP_OK;
+}
+
+/* Send what can be sent now */
+static int
+many_ready(Many *m)
+{
+        for (int i = 0; i < m->n; i++) {
+                SftpFile *f = &m->f[i];
+                int st      = SFTP_OK;
+                if (f->state == F_OPEN && has_room(m, 1, 0)) {
+                        uint32_t id = request_begin(m->s, FXP_OPEN);
+                        put_str(m->s, f->path);
+                        put_u32(m->s, m->up ? FXF_WRITE | FXF_CREAT | FXF_TRUNC : FXF_READ);
+                        put_attrs(m->s, &(SftpAttrs) { 0 });
+                        st       = many_send(m, id, i, Q_OPEN, 0, 0);
+                        f->state = F_OPENING;
+                } else if (f->state == F_DATA) {
+                        st = m->up ? put_data(m, i) : get_data(m, i);
+                }
+                if (st) return st;
+        }
+        return SFTP_OK;
+}
+
+/* Is what LSTAT found (FOUND: something's there, with attributes A) of type
+ * EXPECT (see SftpFile), and for a file with E's size, mtime and mode? */
+static int
+as_expected(char expect, const SftpAttrs *e, int found, const SftpAttrs *a)
+{
+        char type = !found ? 0 : S_ISREG(a->perm) ? 'f' : S_ISDIR(a->perm) ? 'd' : S_ISLNK(a->perm) ? 'l' : '?';
+        if (type != expect) return 0;
+        return type != 'f' || (a->size == e->size && a->mtime == e->mtime && (a->perm & 07777) == (e->perm & 07777));
+}
+
+static int
+target_expected(const SftpFile *f, int found, const SftpAttrs *a)
+{
+        return as_expected(f->expect, &f->expect_attrs, found, a);
+}
+
+/* Read the reply to the oldest request, and act on it */
+static int
+many_reply(Many *m)
+{
+        Sftp *s = m->s;
+        uint8_t type;
+        Reader r;
+        int st = packet_recv(s, &type, &r);
+        if (st) return st;
+        Asked a = m->q[m->head];
+        m->head = (m->head + 1) % MANY_REQUESTS;
+        m->count--;
+        if (a.kind == Q_WRITE || a.kind == Q_READ) m->data -= a.len;
+        uint32_t id = get_u32(&r);
+        if (r.bad || id != a.id) return fail(s, SFTP_ERR_IO, "reply %u does not match request %u", id, a.id);
+        SftpFile *f = &m->f[a.file];
+        f->waiting--;
+
+        if (a.kind == Q_OPEN && type == FXP_HANDLE) {
+                uint32_t len;
+                const char *data = get_str(&r, &len);
+                if (r.bad || len > sizeof f->h.data) return fail(s, SFTP_ERR_IO, "bad HANDLE reply");
+                memcpy(f->h.data, data, len);
+                f->h.len = len;
+                f->state = F_DATA;
+        } else if (a.kind == Q_READ && type == FXP_DATA) {
+                f->reads--;
+                uint32_t len;
+                const char *data = get_str(&r, &len);
+                if (r.bad || len > a.len) return fail(s, SFTP_ERR_IO, "bad DATA reply");
+                __atomic_fetch_add(&sftp_moved, len, __ATOMIC_RELAXED);
+                if (pwrite_all(f->fd, data, len, a.offset)) {
+                        fail(s, SFTP_FAILURE, "write: %s", strerror(errno));
+                        file_fail(s, f, SFTP_FAILURE, 0);
+                } else if (len < a.len) {
+                        /* Short: asked again, one at a time */
+                        if (f->retry_len)
+                                file_fail(s, f, SFTP_FAILURE, 0);
+                        else {
+                                f->retry_offset = a.offset + len;
+                                f->retry_len    = a.len - len;
+                        }
+                }
+        } else if (a.kind == Q_LSTAT && type == FXP_ATTRS) {
+                SftpAttrs now;
+                get_attrs(&r, &now);
+                if (r.bad) return fail(s, SFTP_ERR_IO, "truncated ATTRS reply");
+                if (!target_expected(f, 1, &now)) file_fail(s, f, SFTP_CHANGED, SFTP_AT_CHECK);
+        } else {
+                int rs = read_status(s, type, &r);
+                if (rs == SFTP_ERR_IO) return rs;
+                switch (a.kind) {
+                case Q_OPEN:
+                        file_fail(s, f, rs, SFTP_AT_OPEN);
+                        f->state = F_DONE;
+                        break;
+                case Q_READ:
+                        f->reads--;
+                        file_fail(s, f, rs == SFTP_EOF ? SFTP_CHANGED : rs, 0); // shorter than listed
+                        break;
+                case Q_LSTAT:
+                        if (rs != SFTP_NO_SUCH_FILE)
+                                file_fail(s, f, rs, SFTP_AT_CHECK);
+                        else if (!target_expected(f, 0, NULL))
+                                file_fail(s, f, SFTP_CHANGED, SFTP_AT_CHECK);
+                        break;
+                case Q_RENAME:
+                        if (rs) file_fail(s, f, rs, SFTP_AT_RENAME);
+                        f->state = F_DONE;
+                        break;
+                case Q_WRITE:
+                        if (rs == SFTP_OK) __atomic_fetch_add(&sftp_moved, a.len, __ATOMIC_RELAXED);
+                        /* fall through */
+                case Q_SETSTAT:
+                case Q_CLOSE:
+                        if (m->up && rs) file_fail(s, f, rs, SFTP_AT_WRITE);
+                        break;
+                }
+        }
+
+        /* A put whose requests are all answered: rename it, or remove it */
+        if (m->up && f->state == F_CLOSING && f->waiting == 0) {
+                uint32_t nid;
+                if (f->status == SFTP_OK && s->posix_rename) {
+                        nid = request_begin(s, FXP_EXTENDED);
+                        put_str(s, "posix-rename@openssh.com");
+                        put_str(s, f->path);
+                        put_str(s, f->target);
+                        f->state = F_RENAMING;
+                        return many_send(m, nid, a.file, Q_RENAME, 0, 0);
+                }
+                if (f->status == SFTP_OK) {
+                        file_fail(s, f, SFTP_OP_UNSUPPORTED, SFTP_AT_RENAME); // the caller renames it
+                        f->state = F_DONE;
+                        return SFTP_OK;
+                }
+                nid = request_begin(s, FXP_REMOVE);
+                put_str(s, f->path);
+                f->state = F_DONE;
+                return many_send(m, nid, a.file, Q_REMOVE, 0, 0);
+        }
+        return SFTP_OK;
+}
+
+static int
+many(Sftp *s, SftpFile *files, int n, int up)
+{
+        Many m = { .s = s, .f = files, .n = n, .up = up };
+        for (int i = 0; i < n; i++) {
+                SftpFile *f = &files[i];
+                f->status = SFTP_OK;
+                f->at     = 0;
+                f->state  = F_OPEN;
+                f->eof = f->waiting = f->reads = 0;
+                f->offset = f->retry_offset = f->retry_len = 0;
+        }
+        for (;;) {
+                int st = many_ready(&m);
+                if (!st && m.count == 0) return SFTP_OK;
+
+                /* Only the answers that don't matter are left (CLOSEs of
+                 * reads, REMOVEs of failed puts): read them before the next
+                 * request, like close_handle_async */
+                int matter = 0;
+                for (int k = 0; k < m.count; k++) {
+                        int kind = m.q[(m.head + k) % MANY_REQUESTS].kind;
+                        if (!(kind == Q_REMOVE || (kind == Q_CLOSE && !up))) matter = 1;
+                }
+                if (!st && !matter) {
+                        s->pending += m.count;
+                        return SFTP_OK;
+                }
+                if (!st) st = many_reply(&m);
+                if (st) {
+                        /* The connection broke: what wasn't done, wasn't */
+                        for (int i = 0; i < n; i++)
+                                if (files[i].state != F_DONE) file_fail(s, &files[i], st, files[i].at ? files[i].at : SFTP_AT_WRITE);
+                        return st;
+                }
+        }
+}
+
+int
+sftp_put_many(Sftp *s, SftpFile *files, int n)
+{
+        return many(s, files, n, 1);
+}
+
+int
+sftp_get_many(Sftp *s, SftpFile *files, int n)
+{
+        return many(s, files, n, 0);
+}
+
+int
+sftp_batch(Sftp *s, SftpOp *ops, int n)
+{
+        for (int i = 0; i < n; i += MANY_REQUESTS) {
+                int m         = n - i < MANY_REQUESTS ? n - i : MANY_REQUESTS;
+                uint32_t base = s->next_id;
+                int st;
+                for (int k = i; k < i + m; k++) {
+                        static const uint8_t type[] = {
+                                [SFTP_OP_LSTAT] = FXP_LSTAT, [SFTP_OP_SETSTAT] = FXP_SETSTAT,
+                                [SFTP_OP_MKDIR] = FXP_MKDIR, [SFTP_OP_RMDIR] = FXP_RMDIR,
+                                [SFTP_OP_REMOVE] = FXP_REMOVE, [SFTP_OP_RENAME] = FXP_RENAME,
+                        };
+                        request_begin(s, type[ops[k].op]);
+                        put_str(s, ops[k].path);
+                        if (ops[k].op == SFTP_OP_RENAME) put_str(s, ops[k].to);
+                        if (ops[k].op == SFTP_OP_SETSTAT || ops[k].op == SFTP_OP_MKDIR) put_attrs(s, &ops[k].attrs);
+                        if ((st = packet_send(s))) return st;
+                }
+                for (int k = i; k < i + m; k++) {
+                        SftpOp *o = &ops[k];
+                        uint8_t type;
+                        Reader r;
+                        if ((st = packet_recv(s, &type, &r))) return st;
+                        uint32_t id = get_u32(&r);
+                        if (r.bad || id != base + (k - i))
+                                return fail(s, SFTP_ERR_IO, "reply %u does not match request %u", id, base + (k - i));
+                        if (o->op == SFTP_OP_LSTAT && type == FXP_ATTRS) {
+                                get_attrs(&r, &o->attrs);
+                                if (r.bad) return fail(s, SFTP_ERR_IO, "truncated ATTRS reply");
+                                o->status = SFTP_OK;
+                        } else {
+                                o->status = read_status(s, type, &r);
+                                if (o->status == SFTP_ERR_IO) return o->status;
+                        }
+                        if (o->status != SFTP_OK) snprintf(o->error, sizeof o->error, "%s", s->error);
+                }
+        }
+        return SFTP_OK;
 }
 
 int

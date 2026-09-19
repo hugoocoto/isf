@@ -32,51 +32,109 @@ How the tests work:
 - `test/lib.sh` gives each test `$L` (local folder) and `$R` (remote folder), with `start`/`stop`/`run`, `wait_same` (compares `tree` listings) and `expect_*`.
 - `XDG_STATE_HOME` points at the test's temp dir.
 - Only `sftp-server` is needed, no ssh server.
-- Variables `fake-ssh` reads:
-  - `ISF_TEST_LATENCY_MS`: round-trip delay on SFTP traffic, through `test/latency.py`.
+- What `fake-ssh` reads:
+  - `ISF_TEST_LATENCY_MS`: round-trip delay on SFTP and agent traffic, through `test/latency.py` (which exits with its program's status).
+  - `ISF_TEST_SFTP_LOG`: count the SFTP requests (`latency.py` writes them per connection, with the relay's `start` time). In a test, `count_requests` turns it on; then `requests TYPE` sums a type (`MKDIR`, `READ`, `rounds`...) and `main_requests TYPE` reads the main connection only: the first one opened since `requests_clear`.
+    - A "round" is a request sent after a reply came back: pipelined requests make one, one-by-one requests one each. Use it to guard round trips.
+    - Each relay keeps its totals until it's killed, so `requests_clear` copies them as a baseline (`sftp-base.*`) that the counts subtract.
+  - `ISF_TEST_SFTP_FLAGS`: passed to `sftp-server`. `-P posix-rename` makes a server without it (`t-no-posix-rename`).
   - `ISF_TEST_SFTP_LIMIT`: refuse SFTP sessions after that many.
+  - A file named `down` next to the fake remote home: the host is unreachable (exit 255). `t-reconnect.sh` uses it.
+- `WAIT` (seconds, default 10) is how long `start`/`wait_same`/`wait_for` wait. It's measured on a clock: raise it for tests with latency.
+- Timing-sensitive tests trigger on requests, not sleeps. For example, `t-remove-race` edits once the removals are counted.
+- `t-progress` runs isf under `script` to give it a terminal (the status line is off on a pipe).
 - `t-watch-limit.sh` re-runs itself under `unshare -Ur` to lower the inotify limit.
-- `test/bench.sh SHAPE FILES [RTT_MS]` times a first sync and an in-sync restart.
+- `test/bench.sh SHAPE FILES [RTT_MS] [SIDE]` times three things: a first sync, a change made right after it (the cost of isf's own echoes), and an in-sync restart.
 - `test/mem.sh FILES DIRS SIDE` prints each process's peak memory.
-- CI (`.github/workflows/release.yml`) runs `make test`, then publishes the static binary, the AppImage and the source for x86_64 and aarch64. The `nightly` release follows `main`; `v*` tags get releases of their own.
+- CI:
+  - `.github/workflows/test.yml` runs `make test` on every push and pull request: gcc, clang, ASan+UBSan and TSan.
+  - `.github/workflows/release.yml` publishes the static binary, the AppImage and the source for x86_64 and aarch64. The `nightly` release follows `main`; `v*` tags get releases of their own.
 
 ## Architecture
 
 The one binary plays two roles:
 
 - **Local (`main.c`).** Parses the scp-style CLI, remembers destinations (`dest-<hash>` files), watches local folders, and runs the event loop.
-- **Remote agent (`agent.c`, hidden `isf --agent DIR...`).** Started over ssh. It watches the remote folders with inotify and reports changes on stdout: a type byte (`R`/`C`/`D`/`O`), the root index byte, then the path ending in NUL. It never transfers data.
+- **Remote agent (`agent.c`, hidden `isf --agent DIR...`).** Started over ssh. It watches the remote folders with inotify and reports changes on stdout. It never transfers data.
+  - Its ready message carries `AGENT_PROTOCOL` and its version. The local side refuses a mismatch, including protocol 1 agents from before versions.
+  - It makes the remote folders if they're missing, watches them, sends their listings (`L`), then says it's ready.
+  - Each change carries the path's lstat (size, mtime, mode) and a kind: `C` a write by anyone but isf, `W` isf's own upload (a rename from its temp file, paired by inotify cookie), `A` attributes only, `D` a directory, `M` a rename inside the folder (MOVED_FROM paired with its MOVED_TO; one left unpaired for 50 ms is sent as the `C`/`D` it is).
+  - The message format is in `agent.h`. Change it only together with `AGENT_PROTOCOL` (3 now; 1 is the last released).
+  - `L` listings: each folder once it's watched, in messages of up to 64 KB, not the folders the remote's `.isfignore` ignores, and no more after `LIST_MAX` entries. A folder it didn't list is listed over SFTP.
+- **Files held open** (`held_*` in `watch.c`, both sides). An IN_MODIFY without its IN_CLOSE_WRITE (a log) is synced once the writes stop for 2 s, or every 30 s while they don't.
 
-All ssh sessions share one ControlMaster connection:
+All ssh sessions share one ControlMaster connection, with keepalives:
 - the main `Sftp` (`sftp.c`, a hand-written SFTP v3 client; no libssh);
 - the agent;
 - `-j` transfer connections in `pool.c`.
 
-One `Sftp` belongs to one thread.
+One `Sftp` belongs to one thread. Once a connection is dead, every call on it fails at once.
 
-**Event loop (`main.c`).** Events call `mark()`, which adds to a per-root dirty set (a bt.h tree: rel → SYNC_* bits). After 100 ms of quiet, or 1 s at most, `flush()` walks each tree in order. It skips paths under a directory already handled whole, calls `reconcile()` for the rest, then `sync_drain()`, then saves the records. A changed `.isfignore` is synced first, then its root is rescanned with the new patterns. The startup order matters: connect, `sync_open` (lock, record, ignore, `looks_wiped`), agent ready, local watches, then the first flush.
+**Losing the connection.** A broken connection doesn't exit. `sftp_ok` notes it once (`sync_lost()`), and the rest of the walk fails fast without changing anything. `watch_loop` then calls `reconnect()`: back off, reconnect, restart the agent, rerun `sync_check` (the wiped-side check), and rescan everything. An agent that exits 1 stopped on purpose (its folder is gone), so isf stops.
+
+**Errors.** `LOG("Error", …)` counts into `log_errors` (atomically: workers log too). The first sync's summary says "not all in sync …, N errors" when there were any.
+
+**Event loop (`main.c`).** Events call `mark()`, which adds to a per-root dirty set (a bt.h tree: rel → SYNC_* bits). After 100 ms of quiet, or 1 s at most, `flush()` walks each tree in order. It skips paths under a directory already handled whole, calls `reconcile()` for the rest, then `sync_drain()`, then saves the records.
+- `rescan(root)` marks `.isfignore` and the whole root. A marked `.isfignore` is synced first, then the root is rescanned with its patterns. After a flush, an `.isfignore` whose ctime changed (`g.ign_stamp`, e.g. received from the remote) is loaded and the root rescanned.
+- The startup order matters: connect; `sync_open` (lock, record, ignore); the agent, ready, with its listings (`root->seed`); `sync_check` (the wiped-side check, which lists the root over SFTP only if the agent didn't); local watches; `rescan`; the first flush. The listings are a snapshot taken after the watches: what changes later arrives as events. Reconnecting forgets old listings (`sync_forget_seed`) and does the same again. The pool connects in the background (`pool_settle` waits for it the first time it's needed).
+- **Output.** Everything printed goes through `say()` (the LOG and VPRINT macros too), so the status line (`status_line()` in `util.c`, stdout on a terminal only) is cleared first and redrawn under it. `sync_progress(1/0)` brackets a flush; after 2 s, `progress_tick` (called from the walk and while `pool_drain` waits) shows the folders listed, then files and bytes (`sftp_moved`, counted by the transfer engine) of those planned. `-q` drops the ↑/↓ lines only.
+
+**Echoes.** isf's own writes come back as events, and each would cost a round trip. So:
+- Agent events store what the agent saw in `root->seen`, and `plan_path` uses that as the remote state instead of an LSTAT (symlinks still LSTAT, for their target).
+- An `M` renames the local copy (`sync_remote_rename`) when both paths are what was recorded and the new one is free here; otherwise both paths are marked (a delete and a fetch). Its own echo here is dropped by `moved()`.
+- A `C` event sets `written` on the path: a write by someone else. `plan_file` treats a written file as changed there, whatever its size and mtime say. That catches same-second, same-size edits, and edits racing isf's own upload.
+- isf's own remote actions besides uploads also produce `C` events, so they're registered first as expectations (`expect()`, `root->expect`):
+  - its renames (`sync_rename`);
+  - conflict copies (`keep_remote_copy`);
+  - uploads put in place by hand: a server without posix-rename renames with link+unlink, and removes the old target first.
+  - A `C` matching an expectation's state is consumed instead of setting `written`. Up to 2 expected states per path; forgotten after a minute.
+- Local events go through `mark_local`, which drops a file that still matches its record (`sync_unchanged`).
+- A new directory's event is skipped only if isf made it: the `sync_on_local_dir` hook watches it at once and adds it to `g.made`. Any other directory that appears is rescanned whole, since its contents have no events of their own.
 
 **Deciding and doing (`plan.c`, `sync.c`).** `reconcile()` builds a `Walk`:
 - **The walk.** `plan_path`/`plan_dir`/`plan_children` read the local state, the remote state (from listings) and the record, and append `Action`s. The pure decisions live in `plan.c` and are unit-tested:
   - `plan_file`: whichever side changed wins; if both changed, the newer mtime; an edit beats a deletion.
   - `decide_dir` and `dir_mode`.
-- **Applying.** `apply_ready()` carries out the steps as soon as they're planned, so transfers overlap the rest of the walk.
-  - A directory's closing steps (RMDIR, or MODE+RECORD) are planned after its contents, from what was planned for them (`plan_keeps`).
+- **Applying.** `apply_ready()` hands steps to a batch as they're planned, so transfers overlap the rest of the walk. `batch_flush` does a batch:
+  - It flushes at 256 steps, at the walk's end, and before a MKDIR with something in the way, since the MKDIRs inside it need that one done first.
+  - A remote file to remove is first moved aside to a temp name and checked there (RENAME+LSTAT, one round). One `sftp_batch` round then sends every MKDIR, REMOVE of what was moved aside (or RENAME back, if it changed), and RMDIR, in plan order. The server does requests in order, so parents come before children and contents before their RMDIR. A write there after the move makes a new file, which stays.
+  - A failed MKDIR is retried alone with `sftp_mkdir_p` (already there, or a parent missing).
+  - Then, in order: the results, and the steps that waited (records, local steps, transfers). Transfers go only now, when their folder exists.
+  - Dry runs don't batch.
+  - A directory's closing steps (RMDIR, or MODE+RECORD) are planned after its contents, from what was planned for them (`plan_keeps`, from the counts in `Walk.keeps`).
+  - `apply_ready` drops the steps done (up to the first still batched), so `Walk.plan` holds the steps not done yet, not the whole tree's. Indices into it don't survive an `apply_ready`.
   - A failed step skips later steps for the same path and everything under it.
   - Steps that change the local side first check it still matches what was planned (`local_unchanged`). A download checks again just before its final rename.
-  - Regular-file COPYs go to the pool. They're recorded and reported in `transfer_done` during `sync_drain`, which also sets the directory modes that were held back.
+  - Steps that replace something remote check it with an LSTAT (`remote_unchanged`). An upload checks just before its rename, inside the engine.
+  - A remote change can still land in the round trip between that check and the upload's RENAME. SFTP has no compare-and-swap. The README says so; tests must not assume otherwise. (Removals don't have this window: they move the file aside first.)
+  - Temp files older than a day (`TEMP_MAX_AGE`) found on either side are leftovers of interrupted transfers: `plan_leftover` plans quiet REMOVEs.
+  - A download's missing local parents are made on the main thread (`local_parents`), with the watch hook.
+  - Regular-file COPYs become `Transfer`s (`transfer_open`/`transfer_run`/`transfer_finish`): to the pool, or run inline as a batch of one. They're recorded and reported in `transfer_done`, from `sync_drain` for pooled ones. `sync_drain` also sets the directory modes that were held back, the remote ones in one `sftp_batch`.
   - `--dry-run` goes through the same path; `g.dry_run` makes each step report instead of act.
 
-**Remote listings (`sync.c`, "read ahead").** When a walk first needs a directory's listing, `read_ahead` lists the whole remote tree under it level by level, one `sftp_readdir_many` batch per level, capped at `READAHEAD_MAX` entries. Results go in a bt.h map that `take_listing` consumes. If a path was never listed but its parent was, it's known to be missing (empty listing, no round trip). A failed listing is an error, not an empty directory. `sftp_readdir_many` splits each level into rounds of 128 directories, which bounds the memory `sftp-server` uses on the remote to queue replies.
+**Remote listings (`sync.c`, "read ahead").** When a walk first needs a directory's listing, `read_ahead` lists the whole remote tree under it level by level, one `sftp_readdir_many` batch per level, capped at `READAHEAD_MAX` entries. Results go in a bt.h map (`ahead`) that `take_listing` consumes. If a path was never listed but its parent was, it's known to be missing: an empty listing with no round trip. It's then remembered as listed, so its own children are known missing too. A failed listing is an error, not an empty directory. `sftp_readdir_many` splits each level into rounds of 128 directories, which bounds the memory `sftp-server` uses on the remote to queue replies.
+- The first walk of a whole root starts from `root->seed`: the root's listing (from the agent, or `looks_wiped`) and, from the agent, the folders below (`seed.below`). `seed_below` puts those in `ahead` and adds a placeholder (not listed) for each subfolder the agent didn't list, so it's listed over SFTP rather than taken for missing. Keep that invariant: a listed folder's subfolders are all in `ahead`, listed or not, or they look empty and their contents deleted. `queue_subdirs` skips folders already listed.
+- The `.isfignore` pre-step reads direct children of the root from the seed. If it sends something, the seed is forgotten (`sync_forget_seed`): the remote isn't what was listed anymore.
 
-**Records.** Each root keeps a `Da(Record)` sorted by rel. Everything under `rel/` is one contiguous range, `["rel/", "rel0")`, which `record_range` finds by binary search. Deletes, child listings and renames are range operations; don't go back to linear scans (the old version was O(n²)). Records are saved in the state directory under an FNV-1a hash of host, port, remote and local path. A `.lock` sidecar is held with `flock`.
+**Transfers (`sftp.c`, `sftp_put_many`/`sftp_get_many`).** A batch of files goes through one request queue, with every file's requests in flight together. Replies come back in order, so the queue says what each one is for.
+- Caps: 256 requests, and `MANY_DATA` bytes of WRITE/READ in flight (16 × 32 KB), to keep `sftp-server`'s memory small. Many small files fit together; a big one streams 32 KB requests.
+- A put: OPEN tmp, WRITEs, FSETSTAT, CLOSE and an LSTAT of the target all together, then posix-rename if the target still matches `expect`.
+- A get reads exactly `size` bytes. A file that turns out shorter reports `SFTP_CHANGED`.
+- Answers that don't matter (a get's CLOSE, a failed put's REMOVE) go to `s->pending`, like `close_handle_async`.
+- Pool workers take up to `POOL_BATCH` (64) jobs at once. `pool_drain` hands jobs back as they finish (so their lines show as they go), and calls a tick while it waits.
+- A `Transfer` waiting in the queue stays small: what's only needed while it's under way (the local file's stat) lives in `transfer_run`'s arrays.
+- Temp names come from a process-wide counter (`temp_path`).
+- `sftp_batch` sends any list of LSTAT/SETSTAT/MKDIR/RMDIR/REMOVE/RENAME (plain: it won't replace) together and reads every reply, with a status and error text for each.
+- `transfer_finish` keeps the failing step's error text (`why`) before cleanup requests overwrite `c->error`.
+
+**Records.** Each root keeps a `Da(Record)` sorted by rel. Everything under `rel/` is one contiguous range, `["rel/", "rel0")`, which `record_range` finds by binary search. Deletes, child listings and renames are range operations; don't go back to linear scans (the old version was O(n²)). Records are saved in the state directory under an FNV-1a hash of host, port, remote and local path; the format is described above `record_load`. Records with a 6th number, from a build between releases, still load. A `.lock` sidecar is held with `flock`.
 
 ## Invariants
 
 - A path from the remote (agent message or listing) must pass `path_safe`/`name_safe` before it builds a local path.
-- Transfers write `.isf.<pid>.<worker>.tmp` and rename it into place. `is_temp_name` names are never synced, and both inotify handlers skip them.
-- `SFTP_ERR_IO` on the main connection is fatal: `sftp_ok` exits. Worker connections set `Sftp.dead`, and `flush()` exits after the drain.
-- bt.h has one global iterator (`bt_iter`/`for_bt_each`). `main.c` uses it on the dirty set while it calls `reconcile()`, so code reached from `reconcile` must never iterate a bt.h tree. That's why the listing cache also keeps its entries in a plain `Da`.
+- Transfers write `.isf.<pid>.<n>.tmp` and rename it into place. `is_temp_name` names are never synced. The local inotify handler skips them. The agent skips them too, except to pair their renames (`W`).
+- After `SFTP_ERR_IO`, nothing exits: everything left in the walk fails fast (`s->dead`), and `watch_loop` reconnects.
+- Don't add to or delete from a bt.h tree while walking it (`for_bt_each`): that moves entries between nodes. Walks themselves nest fine; avoid the old `bt_iter`, which has one global state. bt.h's own tests (in the submodule: `make && ./test`) check the red-black invariants after every operation.
 - `Da_insert(da, e, i)` evaluates `i` after it has appended a zeroed element, so compute the index first.
 - User-visible output (`↑ ↓ !` lines), flags and behavior are documented in `README.md` and in `main.c`'s `HELP`/`flag_add` strings. Keep them in sync.
 
@@ -86,5 +144,5 @@ One `Sftp` belongs to one thread.
 - Comments are plain English and name parameters in CAPS. Header comments are the API docs.
 - Use `cum.h` dynamic arrays (`Da(T)`, `Da_append`, `Da_foreach`, `Da_destroy`). `Da(T)` is an anonymous struct, so typedef it before passing it around. Build argv with `Command_add`.
 - `flag.h` flags are `const char *`, freed by `flag_free()`.
-- Log with the `util.h` macros: `LOG_WARN`, `LOG_ERR` (adds `strerror(errno)`), `LOG("Error", …)`, and `VPRINT` for verbose-only output.
+- Log with the `util.h` macros: `LOG_WARN`, `LOG_ERR` (adds `strerror(errno)`), `LOG("Error", …)`, and `VPRINT` for verbose-only output. Other output during a flush goes through `say()`, not `printf`, so it doesn't write over the status line.
 - Module state lives in a file-level `static struct { … } g;`.

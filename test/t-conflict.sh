@@ -9,6 +9,9 @@ mkdir -p "$L/d/sub"
 echo keep >"$L/d/keep.txt"
 echo gone >"$L/d/gone.txt"
 echo gone >"$L/d/sub/gone.txt"
+mkdir -p "$L/e"
+echo keep >"$L/e/keep.txt"
+echo gone >"$L/e/gone.txt"
 echo base >"$L/one-side.txt"
 mkdir "$L/x"
 echo in >"$L/x/in"
@@ -30,6 +33,9 @@ echo edited >"$R/del-vs-edit.txt"
 # A directory removed on the remote, one file in it edited locally
 rm -r "$R/d"
 echo kept >"$L/d/keep.txt"
+# ... and the other way: made again here for the edit
+rm -r "$L/e"
+echo "kept there" >"$R/e/keep.txt" # (another size: see the README on same-second edits)
 # Only one side changed: no conflict
 echo changed >"$R/one-side.txt"
 # A directory replaced by a file there: the file wins
@@ -52,6 +58,8 @@ expect_file "$L/del-vs-edit.txt" edited
 expect_file "$R/d/keep.txt" kept
 expect_missing "$L/d/gone.txt"
 expect_missing "$L/d/sub"
+expect_file "$L/e/keep.txt" "kept there"
+expect_missing "$R/e/gone.txt"
 expect_file "$L/one-side.txt" changed
 expect_missing "$L/one-side.txt.isf-conflict"
 expect_file "$L/x" file

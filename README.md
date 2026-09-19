@@ -19,7 +19,8 @@ isf: watching for changes, Ctrl-C to stop
 - Linux on both machines (isf uses inotify to see changes).
 - ssh access to the remote, with SFTP enabled (it is by default in OpenSSH).
 - isf installed on both machines: the local one starts a copy on the remote
-  to see the changes made there.
+  to see the changes made there. It has to be the same version: a different
+  one there is refused, with how to copy this one.
 
 ## Install
 
@@ -66,7 +67,7 @@ If isf can't find it, it says so and prints these commands.
 ## Usage
 
 ```
-isf [folder...] [[user@]host:folder] [-p port] [-I path] [-j n] [-n] [-v] [--reset]
+isf [folder...] [[user@]host:folder] [-p port] [-I path] [-j n] [-n] [-q] [-v] [--reset]
 ```
 
 The first time, give the local folder and where it goes, like `scp`:
@@ -106,6 +107,7 @@ isf runs until you press Ctrl-C.
 | `-I`, `--isf PATH` | where isf is on the remote, if it isn't in the `PATH` of ssh commands there |
 | `-j`, `--jobs N` | transfer up to N files at once, over N connections (default 4; 1 turns it off) |
 | `-n`, `--dry-run` | show what syncing would do, change nothing, and exit |
+| `-q`, `--quiet` | don't list each file sent or received: only conflicts, the summary, warnings and errors |
 | `-v`, `--verbose` | show every file system event, and where errors come from in the code |
 | `--reset` | forget what was synced before: sync like the first time |
 | `-V`, `--version` | show the version |
@@ -115,16 +117,30 @@ isf runs until you press Ctrl-C.
 
 ### Speed
 
-isf transfers several files at once, each over its own ssh connection (all
-sharing one login), so a first sync of many files is much faster over a slow
-link. `-j` sets how many; the default is 4. The connections are only used for
+isf transfers files over several ssh sessions at once (all sharing one login);
+`-j` sets how many, the default is 4. On each, it sends or fetches up to 64
+files together, their requests all in flight, so a batch of small files takes
+about the round trips of one: over a link with a 50 ms round trip, 2000 small
+files go in about 2 s. Making folders there, deleting files and folders, and
+setting their modes go in batches the same way: a tree of 80 new folders
+takes a few round trips, not a few per folder. The sessions are only used for
 file data — everything else stays in order on one connection, so the result is
-the same whatever `-j` you pick. `-j 1` transfers one at a time.
+the same whatever `-j` you pick. `-j 1` uses that one connection for the files
+too.
 
-When it scans, isf lists the remote folder a level at a time, every directory
-of a level in one pipelined batch, so checking a deep folder over a slow link
-takes a few round trips per level rather than per directory. It opens its
-connections at once too, so starting up doesn't wait for them one by one.
+When it starts, isf doesn't list the remote folder over SFTP: the copy of isf
+there lists it as it starts watching, and sends it all at once. Checking a
+folder that's already in sync then takes a few round trips, however deep it
+is (over a 50 ms link, under half a second for a tree 11 folders deep). What
+it doesn't send (past 100,000 files, or what the `.isfignore` there ignores)
+is listed a level at a time, every folder of a level in one pipelined batch.
+
+A folder renamed on the remote is renamed here too, not downloaded again (and
+the other way around).
+
+Its own changes don't cost it anything afterwards: the remote side reports
+what it saw of each change, and the files isf just wrote are recognized, so
+none of them is asked about again.
 
 ## What the output means
 
@@ -134,11 +150,25 @@ connections at once too, so starting up doesn't wait for them one by one.
   ↑ dir/               the same for a directory
   ↓ path deleted       removed here because it was removed there (↑: the other way)
   ↑ path mode          only the permissions changed
-  ↑ old → new          renamed here, and renamed there too
+  ↑ old → new          renamed here, and renamed there too (↓: the other way)
   ! path changed on both sides: kept the newest, the other one is path.isf-conflict
 ```
 
-With several folders, paths start with the folder they are in.
+With several folders, paths start with the folder they are in. `-q` leaves out
+the `↑` and `↓` lines.
+
+On a terminal, a sync that takes more than 2 seconds shows how far it got on
+a line of its own under the rest, rewritten as it goes:
+
+```
+isf: comparing, 1200 folders listed
+isf: 1250 of 4000 files, 120 of 800 MB
+```
+
+After the first sync, a line sums it up: `isf: in sync: 3 sent, 2 received`,
+or `already in sync`. If something couldn't be synced it says `not all in
+sync`, with how many errors (they're above it); what failed is tried again
+the next time it changes, or when isf starts.
 
 ## How changes are decided
 
@@ -191,7 +221,9 @@ anymore.
 ## Safety
 
 - Files are written to a temporary `.isf.<pid>.<n>.tmp` next to them and renamed
-  into place, so a half-written file is never seen.
+  into place, so a half-written file is never seen. One left behind by an
+  interrupted transfer (the connection dropped) is removed once it's a day
+  old.
 - Only one isf can sync a given folder to a given place at a time; a second
   one exits with a message instead of racing the first.
 - If a folder that was synced before is empty on one side when isf starts,
@@ -200,9 +232,14 @@ anymore.
   side was emptied by mistake, `isf --reset` copies everything back.
 - If the remote folder is removed or moved while isf runs, isf stops.
 - isf decides what to do for a whole folder, then does it. Before it replaces
-  or removes a local file, it checks that the file is still what it decided
-  on; if you changed it meanwhile, it's left alone, and your change is synced
-  next.
+  or removes a file, on either side, it checks that the file is still what it
+  decided on (for a file it sends, just before it takes the old one's place);
+  if it changed meanwhile, it's left alone, and that change is synced next.
+  To remove a file on the remote, isf first moves it aside and checks it
+  there, so a write that comes after makes a new file, which stays. When it
+  replaces a file on the remote, a change made there in the round trip
+  between the check and the replacing can still be lost: SFTP can't do both
+  at once.
 - A remote folder that can't be read (permissions) is skipped with an error,
   not taken for an empty one.
 - `isf -n` shows what a sync would do without doing it.
@@ -243,17 +280,20 @@ What can run out on a small remote:
 
 ## Limitations
 
-- Changes made on the remote are compared by size and modification time, in
-  whole seconds. An edit there that keeps the size, in the same second as the
-  last sync, can be missed. Local changes don't have this problem.
-- A rename on the remote is copied as a delete and a new file, so a renamed
-  big directory is downloaded again. Renames made locally are renamed on the
-  remote.
+- While isf runs, the remote side reports who wrote each file, so an edit
+  there is seen even if it keeps the size, in the same second. What changed
+  on the remote while isf wasn't running is compared by size and modification
+  time in whole seconds: an edit that kept the size, in the same second as
+  the last sync, can be missed. Local changes don't have this problem.
+- A file that's written to and kept open (a log) is synced once the writes
+  to it stop for 2 seconds, and every 30 seconds while they don't. Others are
+  synced when they're closed.
 - Symlinks are synced, but not their own modification times.
 - Ignored directories that exist when isf starts are still watched, only
   their events are dropped. A huge ignored directory uses many inotify
   watches.
-- If the connection drops, isf stops. Run it again: it syncs what changed
-  meanwhile.
+- If the connection drops, isf connects again when it can (trying again
+  after 1 s, then less and less often, up to once a minute), and then syncs
+  what changed meanwhile on either side.
 - isf runs in the foreground, one host at a time.
 - IPv6 addresses need a host alias in `~/.ssh/config`.

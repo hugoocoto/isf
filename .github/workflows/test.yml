@@ -1,0 +1,51 @@
+name: Test
+
+# make test on every push and pull request: with gcc and clang, and under
+# ASan+UBSan and TSan (a sanitizer report in isf's output fails the test).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            cc: gcc
+            cflags: -O2
+          - name: clang
+            cc: clang
+            cflags: -O2
+          - name: asan+ubsan
+            cc: gcc
+            cflags: -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all
+          - name: tsan
+            cc: clang
+            cflags: -g -O1 -fsanitize=thread
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-sftp-server
+          # t-wide watches thousands of folders
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          # t-watch-limit lowers the limit in a user namespace of its own
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # TSan can't map its shadow memory with the runner's ASLR entropy
+          sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Test
+        env:
+          CC: ${{ matrix.cc }}
+          CFLAGS: ${{ matrix.cflags }}
+          ASAN_OPTIONS: detect_leaks=0
+        run: make test

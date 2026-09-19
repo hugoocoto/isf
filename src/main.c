@@ -20,10 +20,6 @@
 #include "util.h"
 #include "watch.h"
 
-#ifndef VERSION
-#define VERSION "unknown"
-#endif
-
 #define HELP                                                                            \
         "Keeps a local folder and a remote one the same, both ways, over ssh.\n"        \
         "\n"                                                                            \
@@ -42,8 +38,6 @@
  * after the first one if events keep coming */
 #define DEBOUNCE_MS 100
 #define MAX_DELAY_MS 1000
-
-typedef Da(struct pollfd) watch_pollfds;
 
 static struct {
         Da(Root) roots;
@@ -66,14 +60,18 @@ static struct {
         const char *port_flag;    // -p
         const char *isf_flag;     // -I
         const char *verbose_flag; // -v
+        const char *quiet;        // -q
         const char *reset;        // --reset
         const char *jobs_flag;    // -j
         const char *dry_run;      // -n
         const char *version;      // -V
         int jobs;                 // parallel transfer connections
         int save_dest;            // remember where the folders sync to
-        char *ssh_opts[4];        // for both ssh sessions, NULL terminated
+        char *ssh_opts[6];        // for every ssh session, NULL terminated
         Agent remote;             // reports changes on the remote
+        int lost;                 // the connection broke: connect again
+        BT made;                  // local directories isf made, until their IN_CREATE
+        uint64_t *ign_stamp;      // per root: the ctime of the .isfignore loaded
 } g;
 
 #define LOG_SFTP(fmt, ...) LOG("Error", fmt ": %s", ##__VA_ARGS__, g.sftp.error)
@@ -319,6 +317,26 @@ mark(int root, const char *rel, int what)
         bt_add(&g.dirty[root], rel, (void *) (had | what));
 }
 
+/* Look at everything in ROOT again: its .isfignore first (the flush syncs it
+ * before the rest, and loads its patterns), then all of it */
+static void
+rescan(int root)
+{
+        mark(root, IGNORE_FILE, SYNC_DATA);
+        mark(root, "", SYNC_TREE);
+}
+
+/* The ctime of ROOT's .isfignore here (0 if there is none) */
+static uint64_t
+ignore_stamp(const Root *root)
+{
+        const char *path = pathjoin(root->local, IGNORE_FILE);
+        struct stat st;
+        uint64_t stamp = lstat(path, &st) == 0 ? st.st_ctim.tv_sec * 1000000000ull + st.st_ctim.tv_nsec : 0;
+        free((void *) path);
+        return stamp;
+}
+
 /* Is REL inside one of the directories in COVERED? */
 static int
 covered_by(BT *covered, const char *rel)
@@ -334,20 +352,12 @@ covered_by(BT *covered, const char *rel)
         return hit;
 }
 
-/* Wait for the parallel transfers started so far. A broken transfer
- * connection can't be recovered. */
+/* Wait for the parallel transfers started so far. If one's connection broke,
+ * so did the others (they share it): connect again after this flush. */
 static void
 drain(void)
 {
-        if (sync_drain()) {
-                Da_foreach(root, g.roots)
-                {
-                        record_save(root);
-                }
-                LOG_WARN("A transfer connection broke, stopping");
-                sync_shutdown();
-                exit(1);
-        }
+        if (sync_drain()) g.lost = 1;
 }
 
 /* Send every change waiting in g.dirty */
@@ -355,6 +365,7 @@ static void
 flush(void)
 {
         if (g.dirty_count == 0) return;
+        sync_progress(1);
 
         for (int i = 0; i < g.roots.count; i++) {
                 Root *root = &g.roots.items[i];
@@ -366,9 +377,13 @@ flush(void)
                  * anymore has no events. */
                 intptr_t what = (intptr_t) bt_get(dirty, IGNORE_FILE);
                 if (what) {
+                        int sent = sync_stats().sent;
                         reconcile(root, IGNORE_FILE, what, NULL);
                         drain(); // a download of it may be in the pool
+                        /* Sent: the remote folder isn't what was listed */
+                        if (sync_stats().sent != sent) sync_forget_seed(root);
                         ignore_load(&root->ign, root->local);
+                        g.ign_stamp[i] = ignore_stamp(root);
                         mark(i, "", SYNC_TREE);
                 }
 
@@ -392,9 +407,21 @@ flush(void)
 
         /* Wait for the parallel transfers this batch started, then save */
         drain();
+        sync_progress(0);
         Da_foreach(root, g.roots)
         {
                 record_save(root);
+                sync_forget_seen(root);
+        }
+
+        /* A .isfignore this flush wrote here (received from the remote)
+         * hasn't been loaded: load it, and look at everything again with it */
+        for (int i = 0; i < g.roots.count; i++) {
+                Root *root = &g.roots.items[i];
+                if (ignore_stamp(root) == g.ign_stamp[i]) continue;
+                ignore_load(&root->ign, root->local);
+                g.ign_stamp[i] = ignore_stamp(root);
+                mark(i, "", SYNC_TREE);
         }
 }
 
@@ -414,47 +441,55 @@ moved_out(void)
         g.move.active = 0;
 }
 
+/* FROM was renamed to TO in root ROOT_I, on one side, and the other side too:
+ * the changes waiting under the old name are now at the new one */
+static void
+dirty_renamed(int root_i, const char *from, const char *to)
+{
+        BT *dirty       = &g.dirty[root_i];
+        Da(char *) keys = { 0 };
+        BT *d;
+        for_bt_each(d, dirty)
+        {
+                if (!strcmp(d->key, from) || inside(d->key, from)) Da_append(&keys, strdup(d->key));
+        }
+        size_t from_len = strlen(from);
+        Da_foreach(k, keys)
+        {
+                intptr_t what = (intptr_t) bt_get(dirty, *k);
+                bt_del(dirty, *k);
+                g.dirty_count--;
+                const char *rest = *k + from_len;
+                char *rel        = malloc(strlen(to) + strlen(rest) + 1);
+                assert(rel);
+                strcpy(stpcpy(rel, to), rest);
+                mark(root_i, rel, what);
+                free(rel);
+                free(*k);
+        }
+        Da_destroy(&keys);
+}
+
 /* FROM was renamed to TO inside a root: rename the remote copy instead of
  * sending it again */
 static void
 moved(int root_i, const char *from, const char *to, int is_dir)
 {
-        if (sync_rename(&g.roots.items[root_i], from, to)) {
-                /* Changes waiting under the old name are now at the new one */
-                BT *dirty       = &g.dirty[root_i];
-                Da(char *) keys = { 0 };
-                if (bt_get(dirty, from)) Da_append(&keys, strdup(from));
-                if (is_dir) {
-                        BT *d;
-                        for_bt_each(d, dirty)
-                        {
-                                if (inside(d->key, from)) Da_append(&keys, strdup(d->key));
-                        }
-                }
-                size_t from_len = strlen(from);
-                Da_foreach(k, keys)
-                {
-                        intptr_t what = (intptr_t) bt_get(dirty, *k);
-                        bt_del(dirty, *k);
-                        g.dirty_count--;
-                        const char *rest = *k + from_len;
-                        char *rel        = malloc(strlen(to) + strlen(rest) + 1);
-                        assert(rel);
-                        strcpy(stpcpy(rel, to), rest);
-                        mark(root_i, rel, what);
-                        free(rel);
-                        free(*k);
-                }
-                Da_destroy(&keys);
+        Root *root = &g.roots.items[root_i];
+        /* isf's own doing: a rename it received from the remote */
+        if (sync_unchanged(root, from) && sync_unchanged(root, to)) return;
+        if (sync_rename(root, from, to)) {
+                dirty_renamed(root_i, from, to);
         } else {
                 mark(root_i, from, SYNC_DATA);
                 mark(root_i, to, is_dir ? SYNC_TREE : SYNC_DATA);
         }
 }
 
-/* Both ssh sessions (sftp and the agent) share one connection, so there is
- * a single login: the first one becomes the master. The socket goes in a
- * private directory. */
+/* Every ssh session (sftp, the agent, the transfers) shares one connection,
+ * so there is a single login: the first one becomes the master. The socket
+ * goes in a private directory. Keepalives notice a connection that went
+ * silent (a network that went away) in under a minute, to connect again. */
 static void
 make_ssh_opts(void)
 {
@@ -464,7 +499,9 @@ make_ssh_opts(void)
         g.ssh_opts[0] = "-oControlMaster=auto";
         g.ssh_opts[1] = path;
         g.ssh_opts[2] = "-oControlPersist=no";
-        g.ssh_opts[3] = NULL;
+        g.ssh_opts[3] = "-oServerAliveInterval=15";
+        g.ssh_opts[4] = "-oServerAliveCountMax=3";
+        g.ssh_opts[5] = NULL;
 }
 
 /* "N thing" or "N things" */
@@ -474,11 +511,12 @@ print_count(const char *sep, int n, const char *one, const char *many)
         printf("%s%d %s", sep, n, n == 1 ? one : many);
 }
 
+/* After the first sync. ERRORS: how many were said during it. */
 static void
-print_summary(void)
+print_summary(int errors)
 {
         SyncStats st = sync_stats();
-        if (st.sent + st.received + st.conflicts == 0) {
+        if (st.sent + st.received + st.conflicts + errors == 0) {
                 printf("isf: already in sync\n");
                 return;
         }
@@ -487,12 +525,34 @@ print_summary(void)
                 print_count(" ", st.sent, "to send", "to send");
                 print_count(", ", st.received, "to receive", "to receive");
         } else {
-                printf("isf: in sync:");
+                printf(errors ? "isf: not all in sync:" : "isf: in sync:");
                 print_count(" ", st.sent, "sent", "sent");
                 print_count(", ", st.received, "received", "received");
         }
         if (st.conflicts) print_count(", ", st.conflicts, "conflict", "conflicts");
+        if (errors) print_count(", ", errors, "error (see above)", "errors (see above)");
         printf("\n");
+}
+
+/* How to copy this isf to the remote */
+static void
+copy_hint(void)
+{
+        /* In an AppImage, /proc/self/exe is inside its mount, gone when isf
+         * exits: the AppImage itself is the file to copy */
+        char self[PATH_MAX];
+        ssize_t n            = readlink("/proc/self/exe", self, sizeof self - 1);
+        self[n > 0 ? n : 0]  = 0;
+        const char *appimage = getenv("APPIMAGE");
+        if (appimage && *appimage) snprintf(self, sizeof self, "%s", appimage);
+        fprintf(stderr,
+                "     Copy it, for example:\n"
+                "         scp %s%s%s%s %s:.local/bin/isf\n"
+                "     and if ~/.local/bin isn't in the PATH of ssh commands there, say where it is\n"
+                "     (it's remembered):\n"
+                "         isf %s %s:%s -I .local/bin/isf\n",
+                g.port ? "-P " : "", g.port ? g.port : "", g.port ? " " : "", *self ? self : "isf", g.host,
+                g.roots.items[0].local, g.host, g.roots.items[0].remote);
 }
 
 /* The agent exited before it was ready. STATUS 126/127 is the shell on the
@@ -504,30 +564,129 @@ agent_didnt_start(int status)
                 fprintf(stderr, "isf: isf on '%s' stopped before it started (exit status %d)\n", g.host, status);
                 return;
         }
-        /* In an AppImage, /proc/self/exe is inside its mount, gone when isf
-         * exits: the AppImage itself is the file to copy */
-        char self[PATH_MAX];
-        ssize_t n            = readlink("/proc/self/exe", self, sizeof self - 1);
-        self[n > 0 ? n : 0]  = 0;
-        const char *appimage = getenv("APPIMAGE");
-        if (appimage && *appimage) snprintf(self, sizeof self, "%s", appimage);
-        fprintf(stderr,
-                "isf: isf has to be installed on '%s' too, and it isn't (or it isn't in the PATH of ssh\n"
-                "     commands there). Copy it, for example:\n"
-                "         scp %s%s%s%s %s:.local/bin/isf\n"
-                "     and if ~/.local/bin isn't in that PATH, say where it is (it's remembered):\n"
-                "         isf %s %s:%s -I .local/bin/isf\n",
-                g.host, g.port ? "-P " : "", g.port ? g.port : "", g.port ? " " : "", *self ? self : "isf", g.host,
-                g.roots.items[0].local, g.host, g.roots.items[0].remote);
+        fprintf(stderr, "isf: isf has to be installed on '%s' too, and it isn't (or it isn't in the PATH of ssh\n"
+                        "     commands there).\n",
+                g.host);
+        copy_hint();
+}
+
+/* The agent speaks another protocol: another version of isf */
+static void
+agent_mismatch(void)
+{
+        fprintf(stderr, "isf: isf on '%s' is %s, and this one is %s: they don't work together.\n"
+                        "     The same isf has to be on both sides.\n",
+                g.host, g.remote.version ? g.remote.version : "an older version", VERSION);
+        copy_hint();
+}
+
+/* Start the agent and wait until it watches. AGAIN: connecting again, when
+ * the agent not starting may be the connection still failing. Returns 0, 1 if
+ * it can be tried again, or 2 (logged) if not. */
+static void remote_change(char type, int root, const char *rel, const State *seen);
+static void remote_moved(int root, const char *from, const char *to, const State *seen);
+
+/* The agent's listing of a folder, as it started */
+static void
+remote_listed(int root, const char *rel, const SftpAttrs *self, SftpDir *dir)
+{
+        if (root >= g.roots.count) {
+                if (dir) sftp_dir_free(dir);
+                return;
+        }
+        if (dir && !path_safe(rel)) { // damaged, like one that can't be read
+                sftp_dir_free(dir);
+                dir = NULL;
+        }
+        sync_remote_listed(&g.roots.items[root], rel, self, dir);
+}
+static int
+start_agent(int again)
+{
+        Da_foreach(r, g.roots)
+        {
+                sync_forget_seed(r); // listed by an agent before
+        }
+        if (agent_start(&g.remote, g.isf ? g.isf : "isf", g.host, g.port, g.ssh_opts, g.roots.items, g.roots.count))
+                return 2;
+        while (!g.remote.ready) {
+                if (agent_read(&g.remote, remote_change, remote_moved, remote_listed)) {
+                        int status = agent_stop(&g.remote);
+                        if (again && status != 126 && status != 127) return 1;
+                        agent_didnt_start(status);
+                        return 2;
+                }
+        }
+        if (g.remote.protocol != AGENT_PROTOCOL) {
+                agent_mismatch();
+                agent_stop(&g.remote);
+                return 2;
+        }
+        return 0;
+}
+
+/* The connection broke: close what's left of it and connect again, waiting
+ * longer each time. Then everything is looked at again, like at the start:
+ * the changes made meanwhile, on either side, are in the comparison. */
+static void
+reconnect(void)
+{
+        agent_stop(&g.remote);
+        sync_shutdown();
+        sftp_disconnect(&g.sftp);
+        LOG_WARN("Lost the connection to '%s', connecting again", g.host);
+        for (int wait = 1;; wait = wait < 30 ? 2 * wait : 60) {
+                sleep(wait);
+                if (sftp_connect(&g.sftp, g.host, g.port, g.ssh_opts)) continue;
+                sync_init(&g.sftp, g.host, g.port, g.ssh_opts, g.jobs, 0, g.quiet != NULL);
+                int st = start_agent(1);
+                if (st != 0) {
+                        sync_shutdown();
+                        sftp_disconnect(&g.sftp);
+                        if (st == 2) exit(1);
+                        continue;
+                }
+                /* A side that's empty now (a disk lost meanwhile) stops it */
+                Da_foreach(r, g.roots)
+                {
+                        if (sync_check(r)) exit(1);
+                }
+                break;
+        }
+        g.lost = 0;
+        printf("isf: connected to '%s' again\n", g.host);
+        for (int i = 0; i < g.roots.count; i++)
+                rescan(i);
+}
+
+/* The agent reported FROM renamed to TO on the remote, and saw TO as SEEN */
+static void
+remote_moved(int root, const char *from, const char *to, const State *seen)
+{
+        if (root >= g.roots.count) return;
+        if (!path_safe(from) || !path_safe(to) || !*from || !*to) {
+                LOG_WARN("Ignoring an unsafe rename from the remote: '%s' to '%s'", from, to);
+                return;
+        }
+        Root *r    = &g.roots.items[root];
+        int is_dir = seen->type == 'd';
+        if (!ignored(&r->ign, from, is_dir) && !ignored(&r->ign, to, is_dir) && sync_remote_rename(r, from, to, seen)) {
+                dirty_renamed(root, from, to);
+                return;
+        }
+        /* It can't be done the same way here: as a removal and something new */
+        const State gone = { 0 };
+        remote_change(is_dir ? 'D' : 'C', root, from, &gone);
+        remote_change(is_dir ? 'D' : 'C', root, to, seen);
 }
 
 /* A change the agent reported on the remote */
 static void
-remote_change(char type, int root, const char *rel)
+remote_change(char type, int root, const char *rel, const State *seen)
 {
         if (root >= g.roots.count) return;
         if (type == 'O') {
-                mark(root, "", SYNC_TREE);
+                rescan(root);
                 return;
         }
         /* The remote could name a path that leaves the folder (../..): never
@@ -537,7 +696,44 @@ remote_change(char type, int root, const char *rel)
                 return;
         }
         /* 'C', or 'D' if it's a directory */
-        if (!ignored(&g.roots.items[root].ign, rel, type == 'D')) mark(root, rel, SYNC_DATA);
+        if (ignored(&g.roots.items[root].ign, rel, type == 'D')) return;
+        mark(root, rel, SYNC_DATA);
+        if (seen) sync_remote_seen(&g.roots.items[root], rel, seen, type);
+}
+
+/* A local change at REL (PATH), unless it's still what was last synced: then
+ * the event is isf's own doing (a file it received), and looking at it again
+ * would only cost a round trip. A directory that appears is looked at whole,
+ * unless isf made it: what's in another one doesn't show in its own state. */
+static void
+mark_local(int root, const char *path, const char *rel, int what)
+{
+        if (what & SYNC_TREE) {
+                if (bt_get(&g.made, path)) {
+                        bt_del(&g.made, path);
+                        return;
+                }
+        } else if (sync_unchanged(&g.roots.items[root], rel)) {
+                return;
+        }
+        mark(root, rel, what);
+}
+
+/* A file written to without being closed (a log), now that the writes
+ * stopped for a while */
+static void
+held_local(const char *path, int root)
+{
+        mark_local(root, path, rel_path(g.roots.items[root].local, path), SYNC_DATA);
+}
+
+/* sync made a local directory: watch it now, before anything goes in it,
+ * so its own event needn't send for all of it */
+static void
+watch_new_dir(Root *root, const char *path)
+{
+        listen_folder(path, root - g.roots.items, g.fd);
+        bt_add(&g.made, path, (void *) 1);
 }
 
 static void
@@ -547,7 +743,7 @@ handle_event(const struct inotify_event *event, int fd)
                 LOG_WARN("Event queue overflowed, some events were lost: checking everything");
                 moved_out();
                 for (int i = 0; i < g.roots.count; i++)
-                        mark(i, "", SYNC_TREE);
+                        rescan(i);
                 return;
         }
 
@@ -599,12 +795,13 @@ handle_event(const struct inotify_event *event, int fd)
 
         if (event->mask & IN_ATTRIB) { // Metadata  changed——for  example, permissions (e.g., chmod(2)), timestamps (e.g., utimensat(2)), extended attributes (setxattr(2)), link count (since Linux 2.6.25; e.g., for the target of link(2) and for unlink(2)), and user/group ID (e.g., chown(2)).
                 VPRINT("IN_ATTRIB ");
-                if (event->len) mark(root_i, rel, SYNC_ATTR);
+                if (event->len) mark_local(root_i, path, rel, SYNC_ATTR);
         }
 
         if (event->mask & IN_CLOSE_WRITE) { // File opened for writing was closed.
                 VPRINT("IN_CLOSE_WRITE ");
-                mark(root_i, rel, SYNC_DATA);
+                held_forget(path);
+                mark_local(root_i, path, rel, SYNC_DATA);
         }
 
         if (event->mask & IN_CLOSE_NOWRITE) { // File or directory not opened for writing was closed.
@@ -616,12 +813,13 @@ handle_event(const struct inotify_event *event, int fd)
                 /* Watch a new directory first, then send all of it: things
                  * created in it before the watch have no events */
                 if (is_dir) listen_folder(path, root_i, fd);
-                mark(root_i, rel, is_dir ? SYNC_TREE : SYNC_DATA);
+                mark_local(root_i, path, rel, is_dir ? SYNC_TREE : SYNC_DATA);
         }
 
         if (event->mask & IN_DELETE) { // File/directory deleted from watched directory.
                 VPRINT("IN_DELETE ");
-                mark(root_i, rel, SYNC_DATA);
+                held_forget(path);
+                mark_local(root_i, path, rel, SYNC_DATA);
         }
 
         if (event->mask & IN_DELETE_SELF) { // Watched  file/directory  was  itself deleted.  (This event also occurs if an object is moved to another filesystem, since mv(1) in effect copies the file to the other filesystem and then deletes it from the original  filesystem.)   In  addition,  an  IN_IGNORED event will subsequently be generated for the watch descriptor.
@@ -630,7 +828,8 @@ handle_event(const struct inotify_event *event, int fd)
         }
 
         if (event->mask & IN_MODIFY) { // File was modified (e.g., write(2), truncate(2)).
-                VPRINT("IN_MODIFY ");  // IN_CLOSE_WRITE follows, the file is sent then
+                VPRINT("IN_MODIFY ");  // sent at its IN_CLOSE_WRITE, or once the writes stop
+                if (!is_dir) held_write(path, root_i);
         }
 
         if (event->mask & IN_MOVE_SELF) { // Watched file/directory was itself moved.
@@ -644,6 +843,7 @@ handle_event(const struct inotify_event *event, int fd)
 
         if (event->mask & IN_MOVED_FROM) { // Generated for the directory containing the old filename when a file is renamed.
                 VPRINT("IN_MOVED_FROM ");
+                held_forget(path);
                 g.move.active = 1;
                 g.move.cookie = event->cookie;
                 g.move.root   = root_i;
@@ -656,9 +856,13 @@ handle_event(const struct inotify_event *event, int fd)
                 if (g.move.active && g.move.cookie == event->cookie && g.move.root == root_i) {
                         renamed = 1; // done below, after printing the event
                 } else {
-                        /* Moved in from outside, or from another root */
+                        /* Moved in from outside, or from another root (or a
+                         * file isf received, renamed from its temp file) */
                         moved_out();
-                        mark(root_i, rel, is_dir ? SYNC_TREE : SYNC_DATA);
+                        if (is_dir)
+                                mark(root_i, rel, SYNC_TREE); // isf makes its directories, it doesn't move them in
+                        else
+                                mark_local(root_i, path, rel, SYNC_DATA);
                 }
                 /* A renamed directory keeps its watches (same wds), this
                  * updates their paths */
@@ -678,35 +882,48 @@ handle_event(const struct inotify_event *event, int fd)
         free((void *) path);
 }
 
-int
-poll_watch_fds(watch_pollfds fds)
+/* Wait for events on both sides and send them, until the agent stops on its
+ * own or something fails. Returns 1 then. */
+static int
+watch_loop(void)
 {
         for (;;) {
-                /* With changes waiting, wait only DEBOUNCE_MS for more */
+                if (g.lost || sync_lost()) reconnect();
+
+                struct pollfd fds[] = {
+                        { .fd = g.fd, .events = POLLIN },           // inotify
+                        { .fd = g.remote.from, .events = POLLIN }, // the agent
+                };
+                /* With changes waiting, wait only DEBOUNCE_MS for more, or
+                 * until a file held open is due */
                 int pending  = g.dirty_count > 0 || g.move.active;
-                int poll_num = poll(fds.items, fds.count, pending ? DEBOUNCE_MS : -1);
+                int wait     = pending ? DEBOUNCE_MS : -1;
+                int held     = held_timeout();
+                int for_held = held >= 0 && (wait < 0 || held < wait);
+                int poll_num = poll(fds, 2, for_held ? held : wait);
                 if (poll_num == -1) {
                         if (errno == EINTR) continue;
                         LOG_ERR("poll");
                         return 1;
                 }
+                held_due(held_local);
 
-                if (poll_num > 0) {
-                        Da_foreach(fd, fds)
-                        {
-                                if (fd->fd == g.remote.from && fd->revents) {
-                                        if (agent_read(&g.remote, remote_change)) {
-                                                LOG_WARN("The agent on the remote exited, stopping");
-                                                return 1;
-                                        }
-                                } else if (fd->revents & POLLIN) {
-                                        /* Inotify events are available.  */
-                                        if (handle_events(fd->fd, handle_event)) return 1;
-                                }
+                if (fds[0].revents & POLLIN) {
+                        if (handle_events(g.fd, handle_event)) return 1;
+                }
+                if (fds[1].revents && agent_read(&g.remote, remote_change, remote_moved, remote_listed)) {
+                        /* Exit status 1 is the agent stopping on its own: its
+                         * folder was removed. Anything else (ssh's 255, a
+                         * signal) is the connection. */
+                        if (agent_stop(&g.remote) == 1) {
+                                LOG_WARN("The agent on the remote stopped, stopping");
+                                return 1;
                         }
+                        g.lost = 1;
+                        continue;
                 }
 
-                if (poll_num == 0) {
+                if (poll_num == 0 && !for_held) {
                         /* Quiet: a MOVED_TO would have arrived by now */
                         moved_out();
                         flush();
@@ -732,6 +949,7 @@ main(int argc, char **argv)
         flag_add(&g.isf_flag, "--isf", "-I", .nargs = 1,
                  .help = "where isf is on the remote, if it isn't in the PATH of ssh commands there");
         flag_add(&g.verbose_flag, "--verbose", "-v", .help = "show every event, and where errors come from");
+        flag_add(&g.quiet, "--quiet", "-q", .help = "don't list each file sent or received");
         flag_add(&g.reset, "--reset", .help = "forget what was synced before: sync like the first time");
         flag_add(&g.jobs_flag, "--jobs", "-j", .nargs = 1, .defaults = "4",
                  .help = "how many files to transfer at once (parallel connections)");
@@ -750,8 +968,9 @@ main(int argc, char **argv)
         }
         verbose = g.verbose_flag != NULL;
         if (parse_args(argc, argv)) return 1;
-        g.dirty = calloc(g.roots.count, sizeof *g.dirty);
-        assert(g.dirty);
+        g.dirty     = calloc(g.roots.count, sizeof *g.dirty);
+        g.ign_stamp = calloc(g.roots.count, sizeof *g.ign_stamp);
+        assert(g.dirty && g.ign_stamp);
         g.jobs = atoi(g.jobs_flag);
         if (g.jobs < 1 || g.jobs > 64) {
                 fprintf(stderr, "isf: -j must be between 1 and 64\n");
@@ -766,7 +985,7 @@ main(int argc, char **argv)
                 LOG_SFTP("Cannot connect to '%s'", g.host);
                 return 1;
         }
-        sync_init(&g.sftp, g.host, g.port, g.ssh_opts, g.jobs, g.dry_run != NULL);
+        sync_init(&g.sftp, g.host, g.port, g.ssh_opts, g.jobs, g.dry_run != NULL, g.quiet != NULL);
         Da_foreach(r, g.roots)
         {
                 if (g.save_dest && !g.dry_run)
@@ -775,10 +994,6 @@ main(int argc, char **argv)
 
         Da_foreach(r, g.roots)
         {
-                if (!g.dry_run && sftp_mkdir_p(&g.sftp, r->remote)) {
-                        LOG_SFTP("Cannot create '%s:%s'", g.host, r->remote);
-                        return 1;
-                }
                 printf("isf: %s ⇄ %s:%s\n", r->local, g.host, r->remote);
                 if (g.roots.count > 1) r->label = r->local;
         }
@@ -786,24 +1001,35 @@ main(int argc, char **argv)
         Da_foreach(r, g.roots)
         {
                 if (sync_open(r, g.reset != NULL)) return 1;
+                g.ign_stamp[r - g.roots.items] = ignore_stamp(r);
         }
 
         if (g.dry_run) {
                 Da_foreach(r, g.roots)
                 {
+                        if (sync_check(r)) return 1;
+                }
+                int errors = logged_errors();
+                sync_progress(1);
+                Da_foreach(r, g.roots)
+                {
                         reconcile(r, "", SYNC_TREE, NULL);
                 }
-                print_summary();
+                sync_progress(0);
+                print_summary(logged_errors() - errors);
                 sftp_disconnect(&g.sftp);
                 flag_free();
                 return 0;
         }
 
-        /* Changes on the remote are watched from before the first sync */
-        if (agent_start(&g.remote, g.isf ? g.isf : "isf", g.host, g.port, g.ssh_opts, g.roots.items, g.roots.count)) return 1;
-        while (!g.remote.ready) {
-                if (agent_read(&g.remote, remote_change)) {
-                        agent_didnt_start(agent_stop(&g.remote));
+        /* Changes on the remote are watched from before the first sync (the
+         * agent makes the remote folders if they're missing), and from
+         * before it's listed */
+        if (start_agent(0)) return 1;
+        Da_foreach(r, g.roots)
+        {
+                if (sync_check(r)) {
+                        agent_stop(&g.remote);
                         return 1;
                 }
         }
@@ -811,6 +1037,7 @@ main(int argc, char **argv)
         int fd = watch_init();
         if (fd < 0) return 1;
         g.fd = fd;
+        sync_on_local_dir(watch_new_dir);
 
         for (int i = 0; i < g.roots.count; i++) {
                 if (listen_folder(g.roots.items[i].local, i, fd)) return 1;
@@ -819,19 +1046,13 @@ main(int argc, char **argv)
         /* Bring both sides together. After the watches, so what changes
          * meanwhile isn't lost: its events come after this. */
         for (int i = 0; i < g.roots.count; i++)
-                mark(i, "", SYNC_TREE);
+                rescan(i);
+        int errors = logged_errors();
         flush();
-        print_summary();
+        print_summary(logged_errors() - errors);
         printf("isf: watching for changes, Ctrl-C to stop\n");
 
-        watch_pollfds fds = { 0 };
-        Da_append(&fds, (struct pollfd) {
-                        .fd     = fd,
-                        .events = POLLIN,
-                        });
-        Da_append(&fds, (struct pollfd) { .fd = g.remote.from, .events = POLLIN });
-
-        int ret = poll_watch_fds(fds);
+        int ret = watch_loop();
         agent_stop(&g.remote);
         sync_shutdown();
         sftp_disconnect(&g.sftp);

@@ -39,6 +39,12 @@ same_local(const State *l, const State *r)
 }
 
 int
+same_remote(const State *m, const State *r)
+{
+        return same(m, r) && !(m->type == 'f' && m->written);
+}
+
+int
 same_data(const State *a, const State *b)
 {
         return a->type == 'f' && b->type == 'f' && a->size == b->size && a->mtime == b->mtime;
@@ -74,7 +80,7 @@ plan_free(Plan *plan)
 void
 plan_file(Plan *plan, const char *rel, const State *L, const State *M, const State *R, int what)
 {
-        int lc = !same_local(L, R), rc = !same(M, R);
+        int lc = !same_local(L, R), rc = !same_remote(M, R);
         if (!lc && !rc) return; // nothing: also what our own changes look like
         if (lc && rc && same(L, M)) {
                 /* Both changed the same way (or first sync) */
@@ -98,8 +104,9 @@ plan_file(Plan *plan, const char *rel, const State *L, const State *M, const Sta
         if (W->type == 0) {
                 plan_add(plan, ACT_REMOVE, up, rel, L, M, NULL);
         } else if (!conflict && L->type == 'f' && M->type == 'f' &&
-                   (up ? what == SYNC_ATTR && L->size == M->size : same_data(M, L))) {
-                /* Only the mode (and up, the times) changed */
+                   (up ? what == SYNC_ATTR && L->size == M->size : same_data(M, L) && M->mode != L->mode)) {
+                /* Only the mode (and up, the times) changed. (Down with the
+                 * same mode, only a write there said it changed: the content.) */
                 plan_add(plan, ACT_ATTRS, up, rel, L, M, NULL);
         } else {
                 plan_add(plan, ACT_COPY, up, rel, L, M, NULL);

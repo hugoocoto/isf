@@ -8,23 +8,46 @@
 
 #include "cum.h"
 
+/* isf's version, from git describe (see the Makefile) */
+#ifndef VERSION
+#define VERSION "unknown"
+#endif
+
 /* -v: show every event, and where errors come from */
 extern int verbose;
+
+/* How many errors were said so far (by any thread): read it with
+ * logged_errors() */
+extern int log_errors;
+static inline int
+logged_errors(void)
+{
+        return __atomic_load_n(&log_errors, __ATOMIC_RELAXED);
+}
+
+/* fprintf to F, stdout or stderr, from any thread, under the status line if
+ * there is one (see status_line): lines printed with it scroll above it. */
+__attribute__((format(printf, 2, 3))) void say(FILE *f, const char *fmt, ...);
+
+/* Keep TEXT on the last line of the terminal, under what's said, until it's
+ * changed or NULL takes it away. Only if stdout is a terminal. */
+void status_line(const char *text);
 
 /* Errors and warnings go to stderr, with where they come from if verbose */
 #define LOG(kind, fmt, ...)                                                         \
         do {                                                                        \
+                if ((kind)[0] == 'E') __atomic_fetch_add(&log_errors, 1, __ATOMIC_RELAXED); \
                 if (verbose)                                                        \
-                        fprintf(stderr, kind " at %s (" __FILE__ ":%d): " fmt "\n", \
-                                __func__, __LINE__, ##__VA_ARGS__);                 \
+                        say(stderr, kind " at %s (" __FILE__ ":%d): " fmt "\n",     \
+                            __func__, __LINE__, ##__VA_ARGS__);                     \
                 else                                                                \
-                        fprintf(stderr, "isf: " fmt "\n", ##__VA_ARGS__);           \
+                        say(stderr, "isf: " fmt "\n", ##__VA_ARGS__);               \
         } while (0)
 
 /* printf, only if verbose */
-#define VPRINT(...)                               \
-        do {                                      \
-                if (verbose) printf(__VA_ARGS__); \
+#define VPRINT(...)                                    \
+        do {                                           \
+                if (verbose) say(stdout, __VA_ARGS__); \
         } while (0)
 
 #define LOG_WARN(fmt, ...) LOG("Warning", fmt, ##__VA_ARGS__)
@@ -48,10 +71,10 @@ int path_safe(const char *rel);
  * no '/'? For names from a remote listing. */
 int name_safe(const char *name);
 
-/* Path of the temp file isf transfers through, in DIR
- * (".isf.<pid>.<worker>.tmp"). The pid keeps concurrent runs from colliding on
- * it, WORKER keeps parallel transfers in the same directory apart. malloc'd. */
-const char *temp_path(const char *dir, int worker);
+/* Path of a temp file for isf to transfer through, in DIR
+ * (".isf.<pid>.<n>.tmp"): the pid keeps concurrent runs apart, N (a new one
+ * each time) the transfers of this one. malloc'd. */
+const char *temp_path(const char *dir);
 /* Is NAME one of isf's temp files (".isf.<pid>.tmp", from any run)? They are
  * never synced. */
 int is_temp_name(const char *name);

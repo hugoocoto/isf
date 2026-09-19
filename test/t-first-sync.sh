@@ -15,6 +15,12 @@ echo r >"$R/r.txt"
 echo x >"$R/rdir/deep/x.txt"
 chmod 600 "$R/r.txt"
 head -c 300000 /dev/urandom >"$R/big.bin"
+: >"$L/empty-here"
+: >"$R/empty-there"
+# Patterns only the remote has apply from the first sync, both ways
+printf '*.skip\n' >"$R/.isfignore"
+echo x >"$R/there.skip"
+echo x >"$L/here.skip"
 
 # On both sides: the same, and different (the newer one wins)
 echo same >"$L/same.txt"
@@ -25,6 +31,10 @@ touch -d '2020-01-01 00:00:00' "$L/both.txt"
 touch -d '2021-01-01 00:00:00' "$R/both.txt"
 
 start
+wait_for '[ -e "$L/.isfignore" ]'
+expect_missing "$L/there.skip"
+expect_missing "$R/here.skip"
+rm "$R/there.skip" "$L/here.skip" # (ignored: they'd stay on their side)
 wait_same
 expect_out "1 conflict"
 expect_file "$L/both.txt" new
