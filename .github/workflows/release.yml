@@ -13,9 +13,10 @@ on:
 
 jobs:
   build:
-    # A newer push makes an older build pointless
+    # A newer push makes an older build pointless. One group per runner: the
+    # matrix jobs would cancel each other in a shared one.
     concurrency:
-      group: release-build-${{ github.ref }}
+      group: release-build-${{ github.ref }}-${{ matrix.runner }}
       cancel-in-progress: true
     strategy:
       matrix:
