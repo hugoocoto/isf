@@ -49,12 +49,18 @@ listed(int root, const char *rel, const SftpAttrs *self, SftpDir *dir)
 }
 
 static void
+placed(uint64_t id, char how)
+{
+        (void) id, (void) how;
+}
+
+static void
 fuzz_agent(const uint8_t *data, size_t size)
 {
         int fd = pipe_of(data, size);
         if (fd == -1) return;
         Agent a = { .pid = -1, .to = -1, .from = fd };
-        while (!agent_read(&a, changed, moved, listed))
+        while (!agent_read(&a, changed, moved, listed, placed))
                 ;
         close(fd);
         Da_destroy(&a.buf);

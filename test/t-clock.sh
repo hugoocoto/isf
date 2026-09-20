@@ -30,7 +30,6 @@ with_agent() {
         WAIT=20 wait_for 'grep -q "watching for changes" "$T/out"'
 }
 
-echo hello >"$L/f"
 agent 600
 with_agent
 wait_same

@@ -40,6 +40,12 @@
 #define DEBOUNCE_MS 100
 #define MAX_DELAY_MS 1000
 
+/* How long isf waits for the agent to say it put a file in place, before
+ * doing it itself (the tests build with a short one) */
+#ifndef PLACE_WAIT_MS
+#define PLACE_WAIT_MS 60000
+#endif
+
 static struct {
         Da(Root) roots;
         Sftp sftp;
@@ -657,11 +663,20 @@ place_files(SyncPlace *places, int n)
                         }
                 }
                 next_id += m;
-                /* Their answers come with everything else the agent says */
+                /* Their answers come with everything else the agent says. One
+                 * that says nothing at all (a wedged one, or something that
+                 * isn't isf) mustn't stop isf: after a while it puts what it
+                 * sent in place itself, over SFTP. */
                 while (asked.left > 0) {
-                        if (agent_read(&g.remote, remote_change, remote_moved, remote_listed, remote_placed)) {
-                                asked  = (typeof(asked)) { 0 };
-                                g.lost = 1;
+                        struct pollfd fd = { .fd = g.remote.from, .events = POLLIN };
+                        int ready        = poll(&fd, 1, PLACE_WAIT_MS);
+                        if (ready == -1 && errno == EINTR) continue;
+                        if (ready == 0)
+                                LOG_WARN("isf on '%s' isn't answering: putting what was sent in place from here", g.host);
+                        if (ready <= 0 ||
+                            agent_read(&g.remote, remote_change, remote_moved, remote_listed, remote_placed)) {
+                                asked = (typeof(asked)) { 0 };
+                                if (ready != 0) g.lost = 1;
                                 return -1;
                         }
                 }
