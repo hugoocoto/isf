@@ -55,4 +55,5 @@ wait_for 'grep -q "Cannot put .host:proj/inthway" "$T/err"'
 expect_err "Cannot put 'host:proj/inthway' in place"
 expect_file "$L/inthway" now-a-file # what's here is untouched, and goes when it can
 [ ! -e "$R/inthway" ] || [ -f "$R/inthway" ] || fail "the folder is still in the way"
-[ -z "$(ls -a "$R" | grep '^\.isf\..*\.tmp$')" ] || fail "a temp file was left there"
+# (isf drops the temp file just after it says so)
+wait_for 'test -z "$(ls -a "$R" | grep "^[.]isf[.].*[.]tmp$")"'
