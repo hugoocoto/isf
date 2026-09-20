@@ -5,3 +5,7 @@
 /AppDir/usr/bin/isf
 /AppDir/.DirIcon
 /.cache/
+
+# Notes for working on isf, not part of it
+/CLAUDE.md
+/NEXT-SESSION.md
