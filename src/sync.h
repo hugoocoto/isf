@@ -61,6 +61,32 @@ int sync_drain(void);
 /* Stop the transfer pool (at exit). */
 void sync_shutdown(void);
 
+/* A path isf itself made while syncing that the other side hasn't got: a file
+ * kept next to another as a conflict copy. sync_take_extra hands them over,
+ * to be synced in the same run instead of waiting for the events they raise. */
+typedef struct {
+        Root *root;
+        char *rel;
+} SyncExtra;
+/* Takes them: *OUT gets the array (free it and each REL). Returns how many. */
+int sync_take_extra(SyncExtra **out);
+
+/* A file isf has written into a temp file on the remote, waiting to be put in
+ * the place of REL there. The other side does it (one lstat and one rename,
+ * with nothing in between), so a change made there meanwhile isn't lost. */
+typedef struct {
+        Root *root;
+        const char *rel;    // where it goes, inside ROOT
+        const char *tmp;    // the temp file it's in, inside ROOT
+        const State *expect; // what REL has to still be (type 0: nothing there)
+        char how;           // out: 'o' done, 'c' it changed there, 'e' it couldn't
+} SyncPlace;
+
+/* How to ask the other side to put files in place (main.c asks the agent).
+ * FN fills in each HOW, and returns -1 if it couldn't ask at all: then isf
+ * puts them in place over SFTP, as it did before the agent could. */
+void sync_on_place(int (*fn)(SyncPlace *places, int n));
+
 /* A run of reconcile() starts (ON), or ended, drained (0). If it goes on for
  * over 2 s, a status line on the terminal says how far it got: the remote
  * folders listed, then the files and bytes transferred of those planned so

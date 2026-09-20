@@ -11,6 +11,7 @@
  * watches the folders and reports what changes. A message is its type, the
  * folder index as a byte, a number as 16 hex digits, then text, NUL
  * terminated:
+ *   'T' at the start: the time there, in seconds, to see if the clocks agree
  *   'L' at the start, before 'R': what's in a folder
  *   'R' ready: AGENT_PROTOCOL, and isf's version
  *   'C' a file was written, made, removed or moved out, not by isf
@@ -30,7 +31,20 @@
  * the first LIST_MAX entries, aren't listed.
  * Protocol 1 (isf before versions) had no number, and no text in 'R'. Both
  * sides have to speak the same one. */
-#define AGENT_PROTOCOL 3
+#define AGENT_PROTOCOL 5
+
+/* The other side also asks the agent to put a file it has just written in
+ * place of another, which the agent does with one lstat and one rename, so
+ * nothing there can change in between (over SFTP there is a round trip
+ * between the two, and a change made in it would be lost):
+ *   'P' put in place: the number is the request's id; the text is what the
+ *       target has to still be (its lstat, in hex, all 0 for "nothing there"),
+ *       the length of the temp file's path in 8 hex digits, that path, and
+ *       then the target's, both inside the folder
+ *   'p' the answer: the number is the id, and the text is 'o' (done), 'c'
+ *       (the target changed: nothing was moved, the temp file is gone) or
+ *       'e' and why
+ * Requests and answers go with the change messages, in both directions. */
 
 /* Remote side: watch ROOTS and report changes on stdout until stdin closes,
  * which means the other side is gone */
@@ -43,6 +57,7 @@ typedef struct {
         int from;    // its stdout: the messages
         int ready;     // got 'R': it's watching
         int protocol;  // its AGENT_PROTOCOL, from 'R'
+        uint64_t time; // the time there when it started, from 'T' (0: didn't say)
         char *version; // its isf version, from 'R' (NULL for protocol 1)
         CharBuf buf;   // read, but not a whole message yet
 } Agent;
@@ -60,7 +75,14 @@ int agent_start(Agent *a, const char *isf, const char *host, const char *port,
  * the agent is gone: then nothing on the remote is seen anymore. */
 int agent_read(Agent *a, void (*handle)(char type, int root, const char *rel, const State *seen),
                void (*moved)(int root, const char *from, const char *to, const State *seen),
-               void (*listed)(int root, const char *rel, const SftpAttrs *self, SftpDir *dir));
+               void (*listed)(int root, const char *rel, const SftpAttrs *self, SftpDir *dir),
+               void (*placed)(uint64_t id, char how));
+
+/* Ask the agent to put the temp file TMP in the place of TARGET (paths inside
+ * the folder ROOT), if TARGET is still what EXPECT says: its size, mtime and
+ * mode, or NULL for "nothing is there". ID comes back with the answer, to
+ * agent_read's PLACED. Returns 1 if the agent is gone. */
+int agent_place(Agent *a, int root, uint64_t id, const SftpAttrs *expect, const char *tmp, const char *target);
 
 /* Stop the agent and wait for it. Returns its exit status, or -1. */
 int agent_stop(Agent *a);

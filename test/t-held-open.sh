@@ -21,3 +21,16 @@ wait_for 'grep -q three "$R/here.log"'
 wait_for 'grep -q three "$L/there.log"'
 exec 3>&- 4>&-
 wait_same
+
+# Rotated while it's held open (a log): the writes after the rename go to the
+# new name, and both arrive
+exec 5>"$L/rot.log"
+echo before >&5
+wait_for 'grep -q before "$R/rot.log" 2>/dev/null'
+mv "$L/rot.log" "$L/rot.log.1"
+echo after >&5
+WAIT=20 wait_for 'grep -q after "$R/rot.log.1" 2>/dev/null'
+settle
+grep -q before "$R/rot.log.1" || fail "what it held before the rename is gone"
+exec 5>&-
+wait_same

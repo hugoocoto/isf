@@ -35,6 +35,7 @@ static struct {
         int quiet;                     // don't report what's sent and received
         int lost;                      // the connection broke: said once
         void (*on_local_dir)(Root *root, const char *path);
+        int (*on_place)(SyncPlace *places, int n); // the agent puts files in place
         int sent, received, conflicts; // for sync_stats
 } g;
 
@@ -641,6 +642,29 @@ fetch_symlink(const char *local, const State *want)
         return 0;
 }
 
+/* Paths kept aside while syncing, for sync_take_extra */
+static Da(SyncExtra) extra;
+
+/* ROOT's REL was kept next to it as a conflict copy: that copy is new to the
+ * other side, so isf syncs it in this same run */
+static void
+kept_aside(Root *root, const char *rel)
+{
+        char *copy = malloc(strlen(rel) + sizeof CONFLICT_SUFFIX);
+        assert(copy);
+        strcpy(stpcpy(copy, rel), CONFLICT_SUFFIX);
+        Da_append(&extra, ((SyncExtra) { root, copy }));
+}
+
+int
+sync_take_extra(SyncExtra **out)
+{
+        int n  = extra.count;
+        *out   = extra.items;
+        extra  = (typeof(extra)) { 0 };
+        return n;
+}
+
 static char *
 conflict_name(const char *path)
 {
@@ -695,6 +719,7 @@ typedef struct {
         State expect; // what the other side has to still have when replaced
         State result; // what to record, once done
         int ok;
+        int place;    // up: written to its temp file there, not in place yet
         int by_hand;  // up: put in place with sftp_rename (it removes the old one first)
 
         /* While it's under way */
@@ -719,10 +744,12 @@ transfer_open(Transfer *t, SftpFile *f, struct stat *st)
                 if (fstat(t->fd, st) == -1 || !S_ISREG(st->st_mode)) return 0;
                 t->parent = parent_dir(t->remote);
                 t->tmp    = (char *) temp_path(t->parent);
+                /* The agent puts it in place, unless there's nobody to ask */
+                t->place  = g.on_place != NULL && !g.dry_run;
                 *f        = (SftpFile) {
                                .fd           = t->fd,
                                .path         = t->tmp,
-                               .target       = t->remote,
+                               .target       = t->place ? NULL : t->remote,
                                .attrs        = attrs_of(st),
                                .size         = st->st_size,
                                .expect       = t->expect.type,
@@ -731,14 +758,13 @@ transfer_open(Transfer *t, SftpFile *f, struct stat *st)
                 return 1;
         }
         t->parent = parent_dir(t->local);
-        t->tmp    = (char *) temp_path(t->parent);
         if (mkdir_p(t->parent) == -1) {
                 LOG_ERR("Cannot create '%s'", t->parent);
                 return 0;
         }
-        t->fd = open(t->tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        t->fd = temp_create(t->parent, &t->tmp);
         if (t->fd == -1) {
-                LOG_ERR("Cannot create '%s'", t->tmp);
+                LOG_ERR("Cannot create a temp file in '%s'", t->parent);
                 return 0;
         }
         *f = (SftpFile) { .fd = t->fd, .path = t->remote, .size = t->want.size };
@@ -761,6 +787,17 @@ transfer_finish(Sftp *c, Transfer *t, SftpFile *f, const struct stat *st)
                                 int io = sftp_put_many(c, f, 1);
                                 r      = io ? io : f->status;
                         }
+                        snprintf(why, sizeof why, "%s", r == f->status ? f->error : c->error);
+                }
+                /* Something is in the way of the temp file (one left by a run
+                 * that was killed, or worse): other names, a few times */
+                for (int i = 0; i < 4 && r != SFTP_OK && r != SFTP_ERR_IO && f->at == SFTP_AT_OPEN; i++) {
+                        free(t->tmp);
+                        t->tmp  = (char *) temp_path(t->parent);
+                        f->path = t->tmp;
+                        if (lseek(t->fd, 0, SEEK_SET) != 0) break;
+                        int io = sftp_put_many(c, f, 1);
+                        r      = io ? io : f->status;
                         snprintf(why, sizeof why, "%s", r == f->status ? f->error : c->error);
                 }
                 if (r != SFTP_OK && r != SFTP_ERR_IO && f->at == SFTP_AT_RENAME) {
@@ -848,11 +885,36 @@ transfer_run(Sftp *c, void **args, int n)
         }
 }
 
+/* isf just put ST at REL there: what it saw of that path before (the agent's
+ * messages about isf's own doing, read while transfers went on) is out of
+ * date, and the plan would go on believing it until the next flush. */
+static void
+seen_now(Root *root, const char *rel, const State *st)
+{
+        State *s = bt_get(&root->seen, rel);
+        if (s == NULL) {
+                s = calloc(1, sizeof *s);
+                assert(s);
+                bt_add(&root->seen, rel, s);
+        }
+        *s         = *st;
+        s->link    = NULL;
+        s->written = 0; // isf's own write, not someone else's
+}
+
+/* Transfers written to their temp file on the remote, waiting to be put in
+ * place (see place_pending) */
+static Da(Transfer *) placing;
+
 /* Record and report a transfer that's done, and free it */
 static void
 transfer_done(void *arg)
 {
         Transfer *t = arg;
+        if (t->ok && t->place) { // sync_drain has it put in place first
+                Da_append(&placing, t);
+                return;
+        }
         /* Counted before it's reported: the report redraws the line under it */
         progress.done++;
         if (progress.on && progress.drawn && t->ok && !g.quiet) progress_draw(now_s());
@@ -865,6 +927,7 @@ transfer_done(void *arg)
                         expect(t->root, t->rel, &t->result);
                 }
                 record_set(t->root, t->rel, &t->result);
+                if (t->up) seen_now(t->root, t->rel, &t->result);
                 report(t->up, t->show, 0, NULL);
         }
         progress_tick();
@@ -1167,6 +1230,7 @@ typedef struct {
 
 static int plan_path(Walk *w, const char *rel, int what, const State *remote_now);
 static void apply_ready(Walk *w);
+static void batch_flush(Walk *w);
 
 /* A temp file older than this is a leftover of an interrupted transfer: one
  * in use is written to all the time */
@@ -1389,6 +1453,13 @@ plan_dir(Walk *w, const char *rel, const State *L, const State *M, const State *
                 /* The file it replaces is kept if it changed */
                 plan_add(plan, ACT_MKDIR, ld, rel, L, M, D);
                 plan->items[plan->count - 1].keep = O->type == 'f' && !same(O, R);
+                if (!ld) {
+                        /* Made here first: what it replaces may be a symlink
+                         * to somewhere else, and what's inside would be read
+                         * through it (that's another folder's, not this one's) */
+                        apply_ready(w);
+                        batch_flush(w);
+                }
                 plan_children(w, rel);
                 plan_add(plan, ACT_MODE, ld, rel, L, M, D);
                 plan->items[plan->count - 1].quiet = 1;
@@ -1491,7 +1562,10 @@ apply_step(Root *root, const Action *a)
                 else if (keep || W->type != 'f')
                         ok = remote_unchanged(g.sftp, remote, &a->M);
                 if (!ok) break;
-                if (keep && !(ok = a->up ? keep_remote_copy(root, a->rel, remote, O) : keep_local_copy(local))) break;
+                if (keep) {
+                        if (!(ok = a->up ? keep_remote_copy(root, a->rel, remote, O) : keep_local_copy(local))) break;
+                        kept_aside(root, a->rel);
+                }
                 const State *expect = keep ? &none : O; // what the other side has now
                 if (!a->up) local_parents(root, local);
 
@@ -1592,6 +1666,7 @@ apply_step(Root *root, const Action *a)
                         if (!(ok = a->up ? remote_unchanged(g.sftp, remote, &a->M) : local_unchanged(local, &a->L))) break;
                         if (a->keep) {
                                 ok = a->up ? keep_remote_copy(root, a->rel, remote, O) : keep_local_copy(local);
+                                if (ok) kept_aside(root, a->rel);
                         } else if (a->up) {
                                 int r = sftp_remove_all(g.sftp, remote);
                                 ok    = r == SFTP_NO_SUCH_FILE || sftp_ok(r, "Cannot remove", remote);
@@ -1731,7 +1806,9 @@ batch_flush(Walk *w)
                         char *keep = malloc(strlen(paths[i]) + sizeof CONFLICT_SUFFIX);
                         assert(keep);
                         strcat(strcpy(keep, paths[i]), CONFLICT_SUFFIX);
-                        if (sftp_rename(g.sftp, aside[i], keep) != SFTP_OK)
+                        if (sftp_rename(g.sftp, aside[i], keep) == SFTP_OK)
+                                kept_aside(root, w->plan.items[w->batch.items[i]].rel);
+                        else
                                 LOG("Error", "Cannot put '%s:%s' back, it's in '%s': %s", g.host, paths[i], aside[i], g.sftp->error);
                         free(keep);
                 }
@@ -2019,10 +2096,76 @@ sync_on_local_dir(void (*fn)(Root *root, const char *path))
         g.on_local_dir = fn;
 }
 
+void
+sync_on_place(int (*fn)(SyncPlace *places, int n))
+{
+        g.on_place = fn;
+}
+
+/* The agent couldn't put T in place: do it over SFTP, as isf did before there
+ * was an agent to ask. Returns 'o', 'c' (it changed there) or 'e'. */
+static char
+place_over_sftp(Transfer *t)
+{
+        if (g.sftp->dead) return 'e';
+        if (!remote_unchanged(g.sftp, t->remote, &t->expect)) {
+                sftp_remove(g.sftp, t->tmp);
+                return 'c';
+        }
+        /* The rename is isf's own doing: not someone else's write */
+        expect(t->root, t->rel, &(State) { 0 });
+        expect(t->root, t->rel, &t->result);
+        int r = sftp_rename(g.sftp, t->tmp, t->remote);
+        if (r != SFTP_OK && r != SFTP_ERR_IO && remote_is_dir(g.sftp, t->remote)) {
+                conn_ok(g.sftp, sftp_remove_all(g.sftp, t->remote), "Cannot remove", t->remote);
+                r = sftp_rename(g.sftp, t->tmp, t->remote);
+        }
+        if (r == SFTP_OK) return 'o';
+        if (r != SFTP_ERR_IO) {
+                LOG("Error", "Cannot put '%s:%s' in place: %s", g.host, t->remote, g.sftp->error);
+                sftp_remove(g.sftp, t->tmp);
+        }
+        return 'e';
+}
+
+/* What was written to temp files on the remote, put in their places: the
+ * agent does it with one lstat and one rename, so a change made there in
+ * between isn't lost. What it couldn't do goes over SFTP. */
+static void
+place_pending(void)
+{
+        int n = placing.count;
+        if (n == 0) return;
+        SyncPlace *asks = calloc(n, sizeof *asks);
+        assert(asks);
+        for (int i = 0; i < n; i++) {
+                Transfer *t = placing.items[i];
+                asks[i]     = (SyncPlace) { .root   = t->root,
+                                            .rel    = t->rel,
+                                            .tmp    = rel_path(t->root->remote, t->tmp),
+                                            .expect = &t->expect };
+        }
+        if (g.on_place(asks, n) == -1)
+                for (int i = 0; i < n; i++)
+                        asks[i].how = 'e';
+
+        for (int i = 0; i < n; i++) {
+                Transfer *t = placing.items[i];
+                char how    = asks[i].how == 'e' ? place_over_sftp(t) : asks[i].how;
+                if (how == 'c') VPRINT("File: %s [changed on the remote meanwhile, left alone]\n", t->remote);
+                t->ok    = how == 'o';
+                t->place = 0;
+                transfer_done(t);
+        }
+        placing.count = 0;
+        free(asks);
+}
+
 int
 sync_drain(void)
 {
         int died = pool_drain(transfer_done, progress_tick);
+        place_pending();   // what was sent, into its place
         apply_dir_modes(); // now that what goes inside is in
         return died;
 }

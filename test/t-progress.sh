@@ -19,8 +19,10 @@ echo there >"$R/both"
 start ./proj host:proj -q
 wait_same
 grep -q '[↑↓]' "$T/out" && fail "-q listed files"
-expect_out "in sync: 2 sent, 1 received"
+expect_out "in sync: 2 sent, 2 received"
 expect_out "! both changed on both sides"
+# The copy it kept aside is on both sides after that one run
+[ -e "$L/both.isf-conflict" ] && [ -e "$R/both.isf-conflict" ] || fail "the conflict copy stayed on one side"
 stop
 
 # Comparing a deep tree over a slow link (a dry run: it exits by itself)

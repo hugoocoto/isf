@@ -162,6 +162,11 @@ test_plan(void)
         CHECK(plans(f2, w1, f1, SYNC_DATA, ACT_COPY, 1, 1));   // written on both sides: a conflict
         CHECK(same_remote(&f1, &f1) && !same_remote(&w1, &f1));
 
+        /* A link with no target read isn't the same as anything */
+        State l1 = { .type = 'l', .link = (char *) "target" }, l2 = { .type = 'l' };
+        CHECK(same(&l1, &l1));
+        CHECK(!same(&l1, &l2) && !same(&l2, &l1) && !same(&l2, &l2));
+
         State d1 = dir(0755), d2 = dir(0700);
         CHECK(decide_dir(&d1, &d1, &d1) == DIR_BOTH);
         CHECK(decide_dir(&d1, &none, &d1) == DIR_GONE);     // deleted there
@@ -209,6 +214,12 @@ got_listed(int root, const char *rel, const SftpAttrs *self, SftpDir *dir)
 }
 
 static void
+got_placed(uint64_t id, char how)
+{
+        (void) id, (void) how;
+}
+
+static void
 got_change(char type, int root, const char *rel, const State *seen)
 {
         (void) type, (void) root, (void) rel, (void) seen;
@@ -245,7 +256,7 @@ read_messages(void (*messages)(int fd))
         send_message(p[1], 'R', AGENT_PROTOCOL, VERSION);
         close(p[1]);
         Agent a = { .pid = -1, .to = -1, .from = p[0] };
-        while (!a.ready && !agent_read(&a, got_change, got_moved, got_listed))
+        while (!a.ready && !agent_read(&a, got_change, got_moved, got_listed, got_placed))
                 ;
         CHECK(a.ready);
         close(p[0]);

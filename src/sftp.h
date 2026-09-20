@@ -166,9 +166,11 @@ enum {
 extern uint64_t sftp_moved;
 
 /* Send N local files, all at once: each into its temp file PATH, with ATTRS,
- * then, if TARGET is still EXPECT, renamed over it. Returns SFTP_OK, or
- * SFTP_ERR_IO if the connection broke; how each file went is in its STATUS
- * and AT. A batch of small files takes about the round trips of one. */
+ * then, if TARGET is still EXPECT, renamed over it. A NULL TARGET leaves the
+ * file in PATH, for the caller to put in place (isf has the agent do that,
+ * where nothing can change in between). Returns SFTP_OK, or SFTP_ERR_IO if
+ * the connection broke; how each file went is in its STATUS and AT. A batch
+ * of small files takes about the round trips of one. */
 int sftp_put_many(Sftp *s, SftpFile *files, int n);
 
 /* Fetch N remote files, all at once: the first SIZE bytes of each PATH into

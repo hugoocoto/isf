@@ -17,6 +17,7 @@
 #include "flag.h"
 #include "sftp.h"
 #include "sync.h"
+#include "update.h"
 #include "util.h"
 #include "watch.h"
 
@@ -64,7 +65,10 @@ static struct {
         const char *reset;        // --reset
         const char *jobs_flag;    // -j
         const char *dry_run;      // -n
+        const char *once;         // --once
         const char *version;      // -V
+        const char *update;       // --update
+        const char *check;        // --check-update
         int jobs;                 // parallel transfer connections
         int save_dest;            // remember where the folders sync to
         char *ssh_opts[6];        // for every ssh session, NULL terminated
@@ -367,46 +371,60 @@ flush(void)
         if (g.dirty_count == 0) return;
         sync_progress(1);
 
-        for (int i = 0; i < g.roots.count; i++) {
-                Root *root = &g.roots.items[i];
-                BT *dirty  = &g.dirty[i];
+        /* Again while isf itself leaves something for the other side (a file
+         * kept aside as a conflict copy is new to it), so one run of syncing
+         * brings both sides together */
+        for (int round = 0; round < 4; round++) {
+                for (int i = 0; i < g.roots.count; i++) {
+                        Root *root = &g.roots.items[i];
+                        BT *dirty  = &g.dirty[i];
 
-                /* A changed .isfignore goes first, then the folder is looked at
-                 * again whole with the new patterns: the paths marked with it
-                 * were filtered with the old ones, and what they don't ignore
-                 * anymore has no events. */
-                intptr_t what = (intptr_t) bt_get(dirty, IGNORE_FILE);
-                if (what) {
-                        int sent = sync_stats().sent;
-                        reconcile(root, IGNORE_FILE, what, NULL);
-                        drain(); // a download of it may be in the pool
-                        /* Sent: the remote folder isn't what was listed */
-                        if (sync_stats().sent != sent) sync_forget_seed(root);
-                        ignore_load(&root->ign, root->local);
-                        g.ign_stamp[i] = ignore_stamp(root);
-                        mark(i, "", SYNC_TREE);
-                }
+                        /* A changed .isfignore goes first, then the folder is looked at
+                         * again whole with the new patterns: the paths marked with it
+                         * were filtered with the old ones, and what they don't ignore
+                         * anymore has no events. */
+                        intptr_t what = (intptr_t) bt_get(dirty, IGNORE_FILE);
+                        if (what) {
+                                int sent = sync_stats().sent;
+                                reconcile(root, IGNORE_FILE, what, NULL);
+                                drain(); // a download of it may be in the pool
+                                /* Sent: the remote folder isn't what was listed */
+                                if (sync_stats().sent != sent) sync_forget_seed(root);
+                                ignore_load(&root->ign, root->local);
+                                g.ign_stamp[i] = ignore_stamp(root);
+                                mark(i, "", SYNC_TREE);
+                        }
 
-                /* In order, a directory comes before what's inside it. If it
-                 * was handled whole, the paths inside are already done. */
-                BT covered = { 0 };
-                BT *d;
-                for_bt_each(d, dirty)
-                {
-                        if (covered_by(&covered, d->key)) continue;
-                        struct stat st;
-                        if (*d->key == 0 && lstat(root->local, &st) == -1)
-                                LOG_WARN("'%s' is gone, the remote folder is left as it is", root->local);
-                        else if (reconcile(root, d->key, (intptr_t) d->value, NULL))
-                                bt_add(&covered, d->key, (void *) 1);
+                        /* In order, a directory comes before what's inside it. If it
+                         * was handled whole, the paths inside are already done. */
+                        BT covered = { 0 };
+                        BT *d;
+                        for_bt_each(d, dirty)
+                        {
+                                if (covered_by(&covered, d->key)) continue;
+                                struct stat st;
+                                if (*d->key == 0 && lstat(root->local, &st) == -1)
+                                        LOG_WARN("'%s' is gone, the remote folder is left as it is", root->local);
+                                else if (reconcile(root, d->key, (intptr_t) d->value, NULL))
+                                        bt_add(&covered, d->key, (void *) 1);
+                        }
+                        bt_destroy(&covered);
+                        bt_destroy(dirty);
                 }
-                bt_destroy(&covered);
-                bt_destroy(dirty);
+                g.dirty_count = 0;
+
+                /* Wait for the parallel transfers this batch started, then save */
+                drain();
+                SyncExtra *extra;
+                int kept = sync_take_extra(&extra);
+                for (int i = 0; i < kept; i++) {
+                        Root *root = extra[i].root;
+                        if (!ignored(&root->ign, extra[i].rel, 0)) mark((int) (root - g.roots.items), extra[i].rel, SYNC_DATA);
+                        free(extra[i].rel);
+                }
+                free(extra);
+                if (g.dirty_count == 0) break;
         }
-        g.dirty_count = 0;
-
-        /* Wait for the parallel transfers this batch started, then save */
-        drain();
         sync_progress(0);
         Da_foreach(root, g.roots)
         {
@@ -575,7 +593,8 @@ static void
 agent_mismatch(void)
 {
         fprintf(stderr, "isf: isf on '%s' is %s, and this one is %s: they don't work together.\n"
-                        "     The same isf has to be on both sides.\n",
+                        "     The same isf has to be on both sides. With releases, 'isf --update'\n"
+                        "     on each takes the newest one.\n",
                 g.host, g.remote.version ? g.remote.version : "an older version", VERSION);
         copy_hint();
 }
@@ -585,6 +604,70 @@ agent_mismatch(void)
  * it can be tried again, or 2 (logged) if not. */
 static void remote_change(char type, int root, const char *rel, const State *seen);
 static void remote_moved(int root, const char *from, const char *to, const State *seen);
+
+static void remote_listed(int root, const char *rel, const SftpAttrs *self, SftpDir *dir);
+
+/* The answers to what isf asked the agent to put in place, by request id */
+static struct {
+        uint64_t first; // the id of places[0]
+        SyncPlace *of;  // [count], what was asked
+        int count;
+        int left; // still without an answer
+} asked;
+
+/* One of them is done: 'o', 'c' (it changed there) or 'e' */
+static void
+remote_placed(uint64_t id, char how)
+{
+        if (id < asked.first || id >= asked.first + (uint64_t) asked.count) return;
+        SyncPlace *p = &asked.of[id - asked.first];
+        if (p->how) return; // answered already
+        p->how = how;
+        asked.left--;
+}
+
+/* Have the agent put each of PLACES in place: it checks and renames there,
+ * so nothing can change in between. Returns 0, or -1 if the agent is gone
+ * (then they keep their temp files, and isf tries again over SFTP). */
+static int
+place_files(SyncPlace *places, int n)
+{
+        /* In chunks: the agent answers, and says what it sees, while isf asks.
+         * Asking for everything at once could fill both pipes and leave the
+         * two of them waiting for each other. */
+        enum { CHUNK = 128 };
+        static uint64_t next_id;
+        if (g.remote.pid <= 0 || n <= 0) return -1;
+
+        for (int done = 0; done < n;) {
+                int m = n - done < CHUNK ? n - done : CHUNK;
+                asked = (typeof(asked)) { .first = next_id, .of = places + done, .count = m, .left = m };
+                for (int i = 0; i < m; i++) {
+                        SyncPlace *p     = &places[done + i];
+                        const State *e   = p->expect;
+                        unsigned type    = e->type == 'f' ? S_IFREG : e->type == 'd' ? S_IFDIR : e->type == 'l' ? S_IFLNK : 0;
+                        SftpAttrs expect = { .size = e->size, .mtime = e->mtime, .perm = e->mode | type };
+                        p->how           = 0;
+                        if (agent_place(&g.remote, (int) (p->root - g.roots.items), next_id + i,
+                                        e->type ? &expect : NULL, p->tmp, p->rel)) {
+                                asked = (typeof(asked)) { 0 };
+                                return -1;
+                        }
+                }
+                next_id += m;
+                /* Their answers come with everything else the agent says */
+                while (asked.left > 0) {
+                        if (agent_read(&g.remote, remote_change, remote_moved, remote_listed, remote_placed)) {
+                                asked  = (typeof(asked)) { 0 };
+                                g.lost = 1;
+                                return -1;
+                        }
+                }
+                done += m;
+        }
+        asked = (typeof(asked)) { 0 };
+        return 0;
+}
 
 /* The agent's listing of a folder, as it started */
 static void
@@ -610,14 +693,24 @@ start_agent(int again)
         if (agent_start(&g.remote, g.isf ? g.isf : "isf", g.host, g.port, g.ssh_opts, g.roots.items, g.roots.count))
                 return 2;
         while (!g.remote.ready) {
-                if (agent_read(&g.remote, remote_change, remote_moved, remote_listed)) {
+                if (agent_read(&g.remote, remote_change, remote_moved, remote_listed, remote_placed)) {
                         int status = agent_stop(&g.remote);
                         if (again && status != 126 && status != 127) return 1;
                         agent_didnt_start(status);
                         return 2;
                 }
         }
-        if (g.remote.protocol != AGENT_PROTOCOL) {
+        /* Both clocks decide which side changed a file last */
+        if (g.remote.time) {
+                long long skew = (long long) g.remote.time - (long long) time(NULL);
+                if (skew > 5 || skew < -5)
+                        LOG_WARN("The clock on '%s' is %lld seconds %s this one: which side changed a file last "
+                                 "can be wrong. Keep both in time (NTP).",
+                                 g.host, skew < 0 ? -skew : skew, skew > 0 ? "ahead of" : "behind");
+        }
+        /* The same isf on both sides: a version that isn't this one may say
+         * the same protocol and still mean something else by it */
+        if (g.remote.protocol != AGENT_PROTOCOL || g.remote.version == NULL || strcmp(g.remote.version, VERSION)) {
                 agent_mismatch();
                 agent_stop(&g.remote);
                 return 2;
@@ -911,7 +1004,7 @@ watch_loop(void)
                 if (fds[0].revents & POLLIN) {
                         if (handle_events(g.fd, handle_event)) return 1;
                 }
-                if (fds[1].revents && agent_read(&g.remote, remote_change, remote_moved, remote_listed)) {
+                if (fds[1].revents && agent_read(&g.remote, remote_change, remote_moved, remote_listed, remote_placed)) {
                         /* Exit status 1 is the agent stopping on its own: its
                          * folder was removed. Anything else (ssh's 255, a
                          * signal) is the connection. */
@@ -954,7 +1047,10 @@ main(int argc, char **argv)
         flag_add(&g.jobs_flag, "--jobs", "-j", .nargs = 1, .defaults = "4",
                  .help = "how many files to transfer at once (parallel connections)");
         flag_add(&g.dry_run, "--dry-run", "-n", .help = "show what syncing would do, change nothing, and exit");
+        flag_add(&g.once, "--once", .help = "sync what's different now and exit, instead of watching for changes");
         flag_add(&g.version, "--version", "-V", .help = "show the version");
+        flag_add(&g.check, "--check-update", .help = "say whether a newer isf has been released (exit status 1 if there is)");
+        flag_add(&g.update, "--update", .help = "replace this isf with the newest release, if it isn't this one");
 
         /* flag_free() frees the values, so it waits until the end */
         if (flag_parse(&argc, &argv)) {
@@ -967,6 +1063,11 @@ main(int argc, char **argv)
                 return 0;
         }
         verbose = g.verbose_flag != NULL;
+        if (g.update || g.check) {
+                int r = update_run(g.update != NULL);
+                flag_free();
+                return r;
+        }
         if (parse_args(argc, argv)) return 1;
         g.dirty     = calloc(g.roots.count, sizeof *g.dirty);
         g.ign_stamp = calloc(g.roots.count, sizeof *g.ign_stamp);
@@ -1038,6 +1139,7 @@ main(int argc, char **argv)
         if (fd < 0) return 1;
         g.fd = fd;
         sync_on_local_dir(watch_new_dir);
+        sync_on_place(place_files); // the agent puts what isf sends in place
 
         for (int i = 0; i < g.roots.count; i++) {
                 if (listen_folder(g.roots.items[i].local, i, fd)) return 1;
@@ -1050,9 +1152,13 @@ main(int argc, char **argv)
         int errors = logged_errors();
         flush();
         print_summary(logged_errors() - errors);
-        printf("isf: watching for changes, Ctrl-C to stop\n");
-
-        int ret = watch_loop();
+        int ret = 0;
+        if (g.once) {
+                ret = logged_errors() - errors ? 1 : 0;
+        } else {
+                printf("isf: watching for changes, Ctrl-C to stop\n");
+                ret = watch_loop();
+        }
         agent_stop(&g.remote);
         sync_shutdown();
         sftp_disconnect(&g.sftp);

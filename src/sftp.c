@@ -1247,7 +1247,7 @@ put_data(Many *m, int i)
                 id = request_begin(s, FXP_CLOSE);
                 put_handle(s, &f->h);
                 if ((st = many_send(m, id, i, Q_CLOSE, 0, 0))) return st;
-                if (f->status == SFTP_OK && f->expect != '-') {
+                if (f->status == SFTP_OK && f->expect != '-' && f->target) {
                         id = request_begin(s, FXP_LSTAT);
                         put_str(s, f->target);
                         if ((st = many_send(m, id, i, Q_LSTAT, 0, 0))) return st;
@@ -1299,7 +1299,9 @@ many_ready(Many *m)
                 if (f->state == F_OPEN && has_room(m, 1, 0)) {
                         uint32_t id = request_begin(m->s, FXP_OPEN);
                         put_str(m->s, f->path);
-                        put_u32(m->s, m->up ? FXF_WRITE | FXF_CREAT | FXF_TRUNC : FXF_READ);
+                        /* EXCL: the temp file is a new one, never something
+                         * left in its place (a symlink to somewhere else) */
+                        put_u32(m->s, m->up ? FXF_WRITE | FXF_CREAT | FXF_EXCL : FXF_READ);
                         put_attrs(m->s, &(SftpAttrs) { 0 });
                         st       = many_send(m, id, i, Q_OPEN, 0, 0);
                         f->state = F_OPENING;
@@ -1410,6 +1412,10 @@ many_reply(Many *m)
         /* A put whose requests are all answered: rename it, or remove it */
         if (m->up && f->state == F_CLOSING && f->waiting == 0) {
                 uint32_t nid;
+                if (f->status == SFTP_OK && f->target == NULL) {
+                        f->state = F_DONE; // written; the caller puts it in place
+                        return SFTP_OK;
+                }
                 if (f->status == SFTP_OK && s->posix_rename) {
                         nid = request_begin(s, FXP_EXTENDED);
                         put_str(s, "posix-rename@openssh.com");

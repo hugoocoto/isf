@@ -49,3 +49,23 @@ jobs:
           CFLAGS: ${{ matrix.cflags }}
           ASAN_OPTIONS: detect_leaks=0
         run: make test
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Fuzz what the other side sends
+        run: |
+          make fuzz CC=clang
+          test/fuzz -max_total_time=120 -rss_limit_mb=2048 -print_final_stats=1
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crash
+          path: crash-*
+          if-no-files-found: ignore

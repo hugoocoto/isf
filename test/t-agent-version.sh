@@ -16,7 +16,15 @@ printf 'R\000'
 printf '%016xv99\000' 99
 exec cat >/dev/null
 END
-chmod +x "$T/old-isf" "$T/new-isf"
+# One that speaks this protocol, but is another version: also refused, since
+# the same number can mean something else in another build
+cat >"$T/other-isf" <<END
+#!/bin/sh
+printf 'R\000'
+printf '%016xv0.0-other\000' $(grep -o 'AGENT_PROTOCOL [0-9]*' "$TOP/src/agent.h" | grep -o '[0-9]*')
+exec cat >/dev/null
+END
+chmod +x "$T/old-isf" "$T/new-isf" "$T/other-isf"
 
 for agent in old new; do
         (cd "$T/local" && exec timeout 20 "$ISF" ./proj host:proj -I "$T/$agent-isf") >"$T/out" 2>"$T/err"
@@ -27,3 +35,8 @@ done
 expect_err "isf on 'host' is v99, and this one is"
 (cd "$T/local" && exec timeout 20 "$ISF" ./proj host:proj -I "$T/old-isf") >"$T/out" 2>"$T/err"
 expect_err "isf on 'host' is an older version"
+
+(cd "$T/local" && exec timeout 20 "$ISF" ./proj host:proj -I "$T/other-isf") >"$T/out" 2>"$T/err"
+[ $? != 0 ] || fail "synced with another version of isf"
+expect_err "isf on 'host' is v0.0-other"
+expect_err "isf --update"

@@ -1,6 +1,7 @@
 /isf
 /isf-*
 /test/unit
+/test/fuzz
 /AppDir/usr/bin/isf
 /AppDir/.DirIcon
 /.cache/

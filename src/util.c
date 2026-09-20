@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -169,6 +170,24 @@ temp_path(const char *dir)
         char name[48];
         snprintf(name, sizeof name, ".isf.%ld.%u.tmp", (long) getpid(), n);
         return pathjoin(dir, name);
+}
+
+int
+temp_create(const char *dir, char **path)
+{
+        for (int i = 0; i < 8; i++) {
+                char *p = (char *) temp_path(dir);
+                int fd  = open(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+                if (fd != -1) {
+                        *path = p;
+                        return fd;
+                }
+                int why = errno;
+                free(p);
+                if (why != EEXIST) return -1; // else: left by a run before, take another name
+        }
+        errno = EEXIST;
+        return -1;
 }
 
 int

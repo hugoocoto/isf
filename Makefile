@@ -15,7 +15,7 @@ ifdef STATIC
 LDFLAGS += -static
 endif
 
-.PHONY: all clean test appimage
+.PHONY: all clean test fuzz appimage
 
 all: $(OUT)
 
@@ -30,8 +30,14 @@ test: $(OUT) test/unit
 	test/unit
 	test/run.sh
 
+# What the other side sends, fuzzed (clang): make fuzz CC=clang
+fuzz: test/fuzz.c $(filter-out src/main.c,$(SRC)) $(HDR)
+	$(CC) -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+		-std=gnu17 -Wall -Wextra -DVERSION='"$(VERSION)"' $(INC) -Isrc \
+		-o test/fuzz test/fuzz.c $(filter-out src/main.c,$(SRC)) -pthread
+
 appimage: $(OUT)
 	./appimage.sh $(OUT)
 
 clean:
-	rm -f $(OUT) test/unit isf-*.AppImage AppDir/usr/bin/isf
+	rm -f $(OUT) test/unit test/fuzz isf-*.AppImage AppDir/usr/bin/isf

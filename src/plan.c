@@ -27,7 +27,9 @@ same(const State *a, const State *b)
         switch (a->type) {
         case 'f': return a->size == b->size && a->mtime == b->mtime && a->mode == b->mode;
         case 'd': return a->mode == b->mode;
-        case 'l': return !strcmp(a->link, b->link);
+        /* A link with no target read (the agent doesn't send it) is never
+         * the same as another: whoever has it asks the remote instead */
+        case 'l': return a->link && b->link && !strcmp(a->link, b->link);
         }
         return 1;
 }

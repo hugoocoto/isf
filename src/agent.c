@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "agent.h"
@@ -110,8 +111,10 @@ move_flush(void)
 }
 
 /* Entries listed at the start, at most: past that, the other side lists the
- * rest itself */
+ * rest itself (the tests build with a small one) */
+#ifndef LIST_MAX
 #define LIST_MAX 100000
+#endif
 /* A listing goes in messages of about this size */
 #define LIST_CHUNK 65536
 
@@ -177,6 +180,102 @@ list_folder(int root_i, const char *path, long *left)
                 free(*p);
         }
         Da_destroy(&subdirs);
+}
+
+/* Put TMP in the place of TARGET (both inside ROOT), if TARGET is still what
+ * EXPECT says (an lstat in hex; all 0: nothing is there). One lstat and one
+ * rename, here, so nothing can change in between. Answers 'p' (see agent.h):
+ * 'o' done, 'c' it changed there (nothing moved, TMP dropped), 'e' it
+ * couldn't, and then TMP is left for the other side to try over SFTP. */
+static void
+place(int root_i, uint64_t id, const char *expect, const char *tmp_rel, const char *target_rel)
+{
+        const char *name = strrchr(tmp_rel, '/');
+        char why[160]    = "";
+        char how         = 'e';
+
+        if (!path_safe(tmp_rel) || !path_safe(target_rel) || !*tmp_rel || !*target_rel ||
+            !is_temp_name(name ? name + 1 : tmp_rel)) {
+                LOG_WARN("Not putting '%s' in the place of '%s': that isn't what isf does", tmp_rel, target_rel);
+                agent_send('p', root_i, id, "e");
+                return;
+        }
+        const char *tmp    = root_join(g.roots[root_i].local, tmp_rel);
+        const char *target = root_join(g.roots[root_i].local, target_rel);
+
+        struct stat st;
+        char now[33] = "00000000000000000000000000000000"; // nothing there
+        if (lstat(target, &st) == 0)
+                stat_text(&st, now);
+        else if (errno != ENOENT)
+                snprintf(why, sizeof why, "%s", strerror(errno));
+
+        if (*why) {
+                how = 'e';
+        } else if (strcmp(now, expect)) {
+                /* Changed since the other side looked: left as it is, and
+                 * what was on its way goes away */
+                how = 'c';
+                unlink(tmp);
+        } else if (rename(tmp, target) == 0) {
+                how = 'o';
+        } else {
+                /* Something unusual (a directory in the way): the other side
+                 * tries it over SFTP, so TMP stays */
+                snprintf(why, sizeof why, "%s", strerror(errno));
+        }
+        agent_send('p', root_i, id, (char[]) { how, 0 });
+        /* Not a warning: the other side tries it over SFTP, and says so if
+         * that fails too */
+        if (how == 'e') VPRINT("File: %s [cannot be put in place here: %s]\n", target_rel, why);
+        free((void *) tmp);
+        free((void *) target);
+}
+
+/* What HEX says (the local side's, further down) */
+static int hex(const char *s, int n, uint64_t *v);
+
+/* Read what the other side asks (its 'P' requests) and answer. Returns 1 when
+ * it's gone (its end of the pipe closed), which stops the agent. */
+static int
+read_requests(void)
+{
+        static CharBuf buf; // what's read, but not a whole message yet
+        char chunk[4096];
+        ssize_t n = read(STDIN_FILENO, chunk, sizeof chunk);
+        if (n == -1 && errno == EINTR) return 0;
+        if (n <= 0) return 1;
+        for (ssize_t i = 0; i < n; i++)
+                Da_append(&buf, chunk[i]);
+
+        /* Like the messages it sends: type, folder, number, text, NUL */
+        size_t start = 0;
+        while (buf.count - start >= 3) {
+                char *nul = memchr(buf.items + start + 2, 0, buf.count - start - 2);
+                if (nul == NULL) break;
+                char type        = buf.items[start];
+                int root         = (unsigned char) buf.items[start + 1];
+                const char *text = buf.items + start + 2;
+                uint64_t id      = 0;
+                start            = nul - buf.items + 1;
+                if (type != 'P' || root >= g.count || nul - text < 48 || !hex(text, 16, &id)) continue;
+
+                /* The lstat it has to still have, the temp file's path (as
+                 * long as the 8 digits say) and the target's */
+                uint64_t len = 0;
+                if (!hex(text + 48, 8, &len) || len > (uint64_t) (nul - text - 56)) continue;
+                char expect[33];
+                memcpy(expect, text + 16, 32);
+                expect[32]        = 0;
+                const char *paths = text + 56;
+                char *tmp         = strndup(paths, len);
+                assert(tmp);
+                place(root, id, expect, tmp, paths + len);
+                free(tmp);
+        }
+        memmove(buf.items, buf.items + start, buf.count - start);
+        buf.count -= start;
+        return 0;
 }
 
 /* A file written to without being closed (a log), now that the writes
@@ -287,6 +386,7 @@ agent_main(Root *roots, int count)
                 ignore_load(&roots[i].ign, roots[i].local);
                 list_folder(i, roots[i].local, &left);
         }
+        agent_send('T', 0, (uint64_t) time(NULL), ""); // to tell the clocks apart
         agent_send('R', 0, AGENT_PROTOCOL, VERSION);
 
         struct pollfd fds[] = {
@@ -307,7 +407,8 @@ agent_main(Root *roots, int count)
                 }
                 if (n == 0 && !for_held) move_flush();
                 held_due(held_remote);
-                if (fds[1].revents) return 0;
+                if ((fds[1].revents & POLLIN) && read_requests()) return 0; // it's gone
+                if (fds[1].revents & (POLLHUP | POLLERR)) return 0;
                 if ((fds[0].revents & POLLIN) && handle_events(fd, agent_event)) return 1;
         }
 }
@@ -424,9 +525,42 @@ read_listing(int root, uint64_t len, const char *text, const char *nul,
 }
 
 int
+agent_place(Agent *a, int root, uint64_t id, const SftpAttrs *expect, const char *tmp, const char *target)
+{
+        char head[57];
+        snprintf(head, sizeof head, "%016llx%016llx%08x%08x%08x", (unsigned long long) id,
+                 (unsigned long long) (expect ? expect->size : 0), expect ? expect->mtime : 0,
+                 expect ? expect->perm : 0, (unsigned) strlen(tmp));
+        CharBuf msg = { 0 };
+        Da_append(&msg, 'P');
+        Da_append(&msg, (char) root);
+        for (const char *p = head; *p; p++)
+                Da_append(&msg, *p);
+        for (const char *p = tmp; *p; p++)
+                Da_append(&msg, *p);
+        for (const char *p = target; *p; p++)
+                Da_append(&msg, *p);
+        Da_append(&msg, 0);
+
+        int gone = 0;
+        for (int done = 0; done < msg.count;) {
+                ssize_t n = write(a->to, msg.items + done, msg.count - done);
+                if (n == -1 && errno == EINTR) continue;
+                if (n <= 0) {
+                        gone = 1;
+                        break;
+                }
+                done += n;
+        }
+        Da_destroy(&msg);
+        return gone;
+}
+
+int
 agent_read(Agent *a, void (*handle)(char type, int root, const char *rel, const State *seen),
            void (*moved)(int root, const char *from, const char *to, const State *seen),
-           void (*listed)(int root, const char *rel, const SftpAttrs *self, SftpDir *dir))
+           void (*listed)(int root, const char *rel, const SftpAttrs *self, SftpDir *dir),
+           void (*placed)(uint64_t id, char how))
 {
         char chunk[65536];
         ssize_t n = read(a->from, chunk, sizeof chunk);
@@ -454,6 +588,10 @@ agent_read(Agent *a, void (*handle)(char type, int root, const char *rel, const 
                         a->protocol = numbered ? (int) value : 1;
                         free(a->version);
                         a->version = numbered ? strdup(text + 16) : NULL;
+                } else if (type == 'p' && numbered) {
+                        placed(value, nul - text > 16 ? text[16] : 'e');
+                } else if (type == 'T' && numbered) {
+                        a->time = value;
                 } else if (type == 'L' && numbered) { // before 'R', which says the protocol
                         read_listing(root, value, text + 16, nul, listed);
                 } else if (a->protocol < 2) {

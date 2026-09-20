@@ -22,3 +22,29 @@ start
 wait_same
 expect_missing "$R/a"
 ! grep -q damaged "$T/err" || fail "the record didn't load"
+
+# A record file cut short, or full of junk: isf says so and syncs anyway,
+# without deleting anything
+stop
+echo c >"$L/c"
+start
+wait_same
+stop
+for f in "$XDG_STATE_HOME"/isf/????????????????; do
+        head -c 40 "$f" >"$f.cut" && mv "$f.cut" "$f"
+done
+start
+wait_same
+settle
+expect_file "$R/c" c
+expect_file "$R/d/b" b
+stop
+
+for f in "$XDG_STATE_HOME"/isf/????????????????; do
+        printf 'not a record at all\n\x01\x02\x03 %s\n' "junk" >"$f"
+done
+start
+wait_same
+settle
+expect_file "$R/c" c
+[ -e "$L/d/b" ] || fail "it deleted what was synced before"

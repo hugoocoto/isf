@@ -71,6 +71,11 @@ int path_safe(const char *rel);
  * no '/'? For names from a remote listing. */
 int name_safe(const char *name);
 
+/* Make a temp file in DIR and open it for writing: a new one, never one
+ * that's there already (someone could leave a symlink in its place, and the
+ * transfer would write through it). *PATH gets its name, to free. Returns the
+ * fd, or -1 (errno set). */
+int temp_create(const char *dir, char **path);
 /* Path of a temp file for isf to transfer through, in DIR
  * (".isf.<pid>.<n>.tmp"): the pid keeps concurrent runs apart, N (a new one
  * each time) the transfers of this one. malloc'd. */

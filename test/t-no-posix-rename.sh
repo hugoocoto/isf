@@ -38,11 +38,21 @@ wait_same
 expect_file "$R/a.isf-conflict" remote
 stop
 
-# No rename at all: a file can't be put in place, and isf says why
+# No rename at all over SFTP: the agent there renames it, so it still goes
 export ISF_TEST_SFTP_FLAGS="-P posix-rename,rename"
 echo new >"$L/new"
 start
-expect_err "Cannot upload 'host:proj/new'"
-! grep -q "No such file" "$T/err" || fail "the error is the cleanup's, not the rename's"
-expect_out "not all in sync"
-expect_missing "$R/new"
+wait_same "a file the agent put in place"
+expect_file "$R/new" new
+
+# But what the agent leaves to isf (a folder in the way of a file) then
+# can't be done, and isf says why
+mkdir -p "$R/inthway" && echo x >"$R/inthway/f"
+wait_for '[ -e "$L/inthway/f" ]'
+settle
+rm -r "$L/inthway" && echo now-a-file >"$L/inthway"
+wait_for 'grep -q "Cannot put .host:proj/inthway" "$T/err"'
+expect_err "Cannot put 'host:proj/inthway' in place"
+expect_file "$L/inthway" now-a-file # what's here is untouched, and goes when it can
+[ ! -e "$R/inthway" ] || [ -f "$R/inthway" ] || fail "the folder is still in the way"
+[ -z "$(ls -a "$R" | grep '^\.isf\..*\.tmp$')" ] || fail "a temp file was left there"
