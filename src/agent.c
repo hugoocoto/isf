@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "agent.h"
+#include "ignore.h"
 #include "sftp.h"
 #include "watch.h"
 
@@ -145,13 +146,20 @@ list_folder(int root_i, const char *path, long *left)
         Da(char *) subdirs = { 0 };
 
         struct dirent *e;
+        int whole = 1; // everything in it could be looked at
         while ((e = readdir(dir))) {
                 if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
                 char *child = (char *) pathjoin(path, e->d_name);
                 struct stat st;
-                if (lstat(child, &st) == -1) { // gone meanwhile
+                if (lstat(child, &st) == -1) {
                         free(child);
-                        continue;
+                        if (errno == ENOENT) continue; // gone meanwhile
+                        /* A folder that can be read but not looked into (no
+                         * x): what's in it would look like nothing, and the
+                         * other side would take it for empty. Say nothing,
+                         * and let it list the folder itself. */
+                        whole = 0;
+                        break;
                 }
                 size_t len = strlen(e->d_name);
                 if ((size_t) msg.count + 32 + len + 1 > LIST_CHUNK && (size_t) msg.count > head) {
@@ -170,8 +178,10 @@ list_folder(int root_i, const char *path, long *left)
                         free(child);
         }
         closedir(dir);
-        Da_append(&msg, 0);
-        agent_send('L', root_i, strlen(rel), msg.items);
+        if (whole) {
+                Da_append(&msg, 0);
+                agent_send('L', root_i, strlen(rel), msg.items);
+        }
         Da_destroy(&msg);
 
         Da_foreach(p, subdirs)
@@ -180,6 +190,15 @@ list_folder(int root_i, const char *path, long *left)
                 free(*p);
         }
         Da_destroy(&subdirs);
+}
+
+/* An ignored folder isn't watched here either: it would only use watches, of
+ * which a small machine hasn't many, for events the other side drops. */
+static int
+skip_watch(int root, const char *path)
+{
+        const char *rel = rel_path(g.roots[root].local, path);
+        return *rel && ignored(&g.roots[root].ign, rel, 1);
 }
 
 /* Put TMP in the place of TARGET (both inside ROOT), if TARGET is still what
@@ -350,6 +369,12 @@ agent_event(const struct inotify_event *event, int fd)
                 free(g.move.path);
                 g.move.active = 0;
         } else if (event->mask & (IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_MOVED_TO)) {
+                /* The patterns changed: what they don't skip anymore is
+                 * watched now (the other side syncs the file itself) */
+                if (!strcmp(event->name, IGNORE_FILE) && !strcmp(w->path, root->local)) {
+                        ignore_load(&g.roots[root_i].ign, root->local);
+                        listen_folder(root->local, root_i, fd);
+                }
                 /* Who wrote it matters: a write by someone else changes it,
                  * whatever its size and mtime (whole seconds) say */
                 char kind = event->mask & IN_ISDIR                                   ? 'D' :
@@ -376,16 +401,18 @@ agent_main(Root *roots, int count)
                         LOG_ERR("Cannot create '%s'", roots[i].local);
                         return 1;
                 }
+                ignore_load(&roots[i].ign, roots[i].local);
+        }
+        watch_skip(skip_watch);
+        for (int i = 0; i < count; i++) {
                 if (listen_folder(roots[i].local, i, fd)) return 1;
         }
         /* What's there now, for the first walk of the other side. Not what
          * its .isfignore here ignores: the other side lists that itself, if
          * its own .isfignore doesn't. */
         long left = LIST_MAX;
-        for (int i = 0; i < count; i++) {
-                ignore_load(&roots[i].ign, roots[i].local);
+        for (int i = 0; i < count; i++)
                 list_folder(i, roots[i].local, &left);
-        }
         agent_send('T', 0, (uint64_t) time(NULL), ""); // to tell the clocks apart
         agent_send('R', 0, AGENT_PROTOCOL, VERSION);
 

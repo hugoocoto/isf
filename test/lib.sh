@@ -75,10 +75,11 @@ check_sanitizers() {
         fi
 }
 
-# Run isf in the foreground (from $T/local) and expect it to exit on its own.
+# Run isf in the foreground (from $T/local) and expect it to exit on its own,
+# within $RUN_TIMEOUT seconds (20 by default; raise it on a slow line).
 # Sets $STATUS.
 run() {
-        (cd "$T/local" && exec timeout 20 "$ISF" "$@" -I "$ISF") >"$T/out" 2>"$T/err"
+        (cd "$T/local" && exec timeout "${RUN_TIMEOUT:-20}" "$ISF" "$@" -I "$ISF") >"$T/out" 2>"$T/err"
         STATUS=$?
         check_sanitizers
 }

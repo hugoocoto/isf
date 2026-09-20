@@ -1153,6 +1153,11 @@ sftp_dir_free(SftpDir *dir)
  * streams in SFTP_MAX_INFLIGHT pieces of SFTP_WRITE_LEN. */
 #define MANY_REQUESTS 256
 #define MANY_DATA (SFTP_MAX_INFLIGHT * SFTP_WRITE_LEN)
+/* With one or two files there is no batch to fill the line, so one file gets
+ * more of it: what goes over between a request and its answer is all a long
+ * link carries. OpenSSH's own sftp keeps this much in flight too. */
+#define FEW_FILES 2
+#define FEW_DATA (4 * MANY_DATA)
 
 enum { F_OPEN, F_OPENING, F_DATA, F_CLOSING, F_RENAMING, F_DONE };
 enum { Q_OPEN, Q_WRITE, Q_READ, Q_SETSTAT, Q_CLOSE, Q_LSTAT, Q_RENAME, Q_REMOVE };
@@ -1200,7 +1205,8 @@ many_send(Many *m, uint32_t id, int i, int kind, uint64_t offset, uint32_t len)
 static int
 has_room(const Many *m, int requests, int data)
 {
-        return m->count + requests <= MANY_REQUESTS && m->data + data <= MANY_DATA;
+        int room = m->n <= FEW_FILES ? FEW_DATA : MANY_DATA;
+        return m->count + requests <= MANY_REQUESTS && m->data + data <= room;
 }
 
 /* Put: WRITEs from its fd, then, written, the attributes, the CLOSE and the

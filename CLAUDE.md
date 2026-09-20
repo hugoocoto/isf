@@ -40,6 +40,8 @@ How the tests work:
 - Only `sftp-server` is needed, no ssh server.
 - What `fake-ssh` reads:
   - `ISF_TEST_LATENCY_MS`: round-trip delay on SFTP and agent traffic, through `test/latency.py` (which exits with its program's status).
+  - `ISF_TEST_BANDWIDTH_KBPS`: how many KB a second the line carries, shared by every session isf opens (they queue on it through `$ISF_TEST_LINE`, a file with a lock). `t-slow` uses both; `t-chaos-live` takes `LAT=` and `KBPS=`.
+  - `RUN_TIMEOUT` (seconds, 20 by default) is how long `run` gives isf to finish: raise it on a slow line.
   - `ISF_TEST_SFTP_LOG`: count the SFTP requests (`latency.py` writes them per connection, with the relay's `start` time). In a test, `count_requests` turns it on; then `requests TYPE` sums a type (`MKDIR`, `READ`, `rounds`...) and `main_requests TYPE` reads the main connection only: the first one opened since `requests_clear`.
     - A "round" is a request sent after a reply came back: pipelined requests make one, one-by-one requests one each. Use it to guard round trips.
     - Each relay keeps its totals until it's killed, so `requests_clear` copies them as a baseline (`sftp-base.*`) that the counts subtract.
@@ -73,6 +75,7 @@ The one binary plays two roles:
   - The message format is in `agent.h`. Change it only together with `AGENT_PROTOCOL` (5 now; 1, 3 and 4 went out in nightlies).
   - **It also puts files in place** (`P` request, `p` answer): isf writes the file to a temp file over SFTP, then asks the agent to lstat the target and rename over it, both there, so a change made in between isn't lost (over SFTP there is a round trip between the two). The agent refuses if the target isn't what isf expected (`c`, and it drops the temp file), and leaves anything unusual (a directory in the way) to isf (`e`, temp file kept), which then does it over SFTP as before (`place_over_sftp`). It only accepts paths inside its folders, with a temp name as the source.
   - `L` listings: each folder once it's watched, in messages of up to 64 KB, not the folders the remote's `.isfignore` ignores, and no more after `LIST_MAX` entries. A folder it didn't list is listed over SFTP.
+- **Ignored folders aren't watched** on either side (`watch_skip`, a predicate per side): their events are dropped anyway, and a big one would use thousands of watches (80 ignored folders: 4 watches instead of 85). `listen_folder` is called again when the patterns are loaded again — on the local side after a flush loads them, on the agent's side when it sees `.isfignore` change — and it lets go of a folder that is skipped now.
 - **Files held open** (`held_*` in `watch.c`, both sides). An IN_MODIFY without its IN_CLOSE_WRITE (a log) is synced once the writes stop for 2 s, or every 30 s while they don't.
 
 All ssh sessions share one ControlMaster connection, with keepalives:
@@ -127,12 +130,14 @@ One `Sftp` belongs to one thread. Once a connection is dead, every call on it fa
   - Regular-file COPYs become `Transfer`s (`transfer_open`/`transfer_run`/`transfer_finish`): to the pool, or run inline as a batch of one. They're recorded and reported in `transfer_done`, from `sync_drain` for pooled ones. `sync_drain` also sets the directory modes that were held back, the remote ones in one `sftp_batch`.
   - `--dry-run` goes through the same path; `g.dry_run` makes each step report instead of act.
 
+**A folder that can't be looked into.** A remote folder with read but no execute permission for isf (mode 644) lists as *empty* instead of failing, both through the agent and through `sftp-server`, and everything here would be deleted to match. The agent doesn't send a listing it couldn't fully `lstat`, and `plan_children` refuses an empty listing from a folder whose mode has no owner execute bit (a root user, who can look inside anyway, gets a listing that isn't empty, so it isn't refused). The folder's own mode is still synced, which is what makes it readable again. `t-unreadable` covers it; it deleted local files before.
+
 **Remote listings (`sync.c`, "read ahead").** When a walk first needs a directory's listing, `read_ahead` lists the whole remote tree under it level by level, one `sftp_readdir_many` batch per level, capped at `READAHEAD_MAX` entries. Results go in a bt.h map (`ahead`) that `take_listing` consumes. If a path was never listed but its parent was, it's known to be missing: an empty listing with no round trip. It's then remembered as listed, so its own children are known missing too. A failed listing is an error, not an empty directory. `sftp_readdir_many` splits each level into rounds of 128 directories, which bounds the memory `sftp-server` uses on the remote to queue replies.
 - The first walk of a whole root starts from `root->seed`: the root's listing (from the agent, or `looks_wiped`) and, from the agent, the folders below (`seed.below`). `seed_below` puts those in `ahead` and adds a placeholder (not listed) for each subfolder the agent didn't list, so it's listed over SFTP rather than taken for missing. Keep that invariant: a listed folder's subfolders are all in `ahead`, listed or not, or they look empty and their contents deleted. `queue_subdirs` skips folders already listed.
 - The `.isfignore` pre-step reads direct children of the root from the seed. If it sends something, the seed is forgotten (`sync_forget_seed`): the remote isn't what was listed anymore.
 
 **Transfers (`sftp.c`, `sftp_put_many`/`sftp_get_many`).** A batch of files goes through one request queue, with every file's requests in flight together. Replies come back in order, so the queue says what each one is for.
-- Caps: 256 requests, and `MANY_DATA` bytes of WRITE/READ in flight (16 × 32 KB), to keep `sftp-server`'s memory small. Many small files fit together; a big one streams 32 KB requests.
+- Caps: 256 requests, and `MANY_DATA` bytes of WRITE/READ in flight (16 × 32 KB). With `FEW_FILES` (2) or fewer in the batch there is no batch to fill the line, so one file may keep `FEW_DATA` (2 MB) in flight, like OpenSSH's own sftp: at a 100 ms round trip that took one file from 3 to 6 MB/s, and `sftp-server` still peaks at 2.2 MB (it writes each request as it reads it).
 - A put: OPEN tmp, WRITEs, FSETSTAT, CLOSE and an LSTAT of the target all together, then posix-rename if the target still matches `expect`.
 - A get reads exactly `size` bytes. A file that turns out shorter reports `SFTP_CHANGED`.
 - Answers that don't matter (a get's CLOSE, a failed put's REMOVE) go to `s->pending`, like `close_handle_async`.

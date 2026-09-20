@@ -15,6 +15,13 @@
 #include "watch.h"
 
 static Da(Watch) watches; // maps event->wd back to a path, sorted by wd
+static int (*skip_folder)(int root, const char *path);
+
+void
+watch_skip(int (*skip)(int root, const char *path))
+{
+        skip_folder = skip;
+}
 
 typedef struct {
         int root;
@@ -232,6 +239,10 @@ watch_dir(const char *path, int root, int fd)
 int
 listen_folder(const char *path, int root, int fd)
 {
+        if (skip_folder && skip_folder(root, path)) {
+                unwatch(path, fd); // it may have been watched before
+                return 0;
+        }
         if (watch_dir(path, root, fd)) return 1;
 
         DIR *dir = opendir(path);

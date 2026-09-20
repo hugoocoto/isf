@@ -1265,10 +1265,11 @@ plan_leftover(Walk *w, const char *rel, const char *name, const SftpEntry *e, co
 
 /* Plan everything directly inside REL, and below: what either side has, and
  * what the record has (gone from one side or both since) */
-static void
-plan_children(Walk *w, const char *rel)
+static int
+plan_children(Walk *w, const char *rel, const State *M)
 {
         Root *root         = w->root;
+        int all            = 0; // everything in it could be looked at
         const char *local  = root_join(root->local, rel);
         const char *remote = root_join(root->remote, rel);
         Names names        = { 0 };
@@ -1278,6 +1279,16 @@ plan_children(Walk *w, const char *rel)
 
         /* Without the remote listing everything there would look deleted */
         if (!sftp_ok(take_listing(root, rel, remote, &have), "Cannot list", remote)) goto out;
+        /* A folder there that can be read but not looked into (no x for isf)
+         * lists as empty instead of failing, and everything here would be
+         * deleted to match it. Only its mode tells the two apart, and syncing
+         * that mode is what makes it readable again. */
+        if (have.count == 0 && M && M->type == 'd' && !(M->mode & 0100)) {
+                LOG("Error", "Cannot look inside '%s:%s' (its mode is %o there): leaving what's in it alone",
+                    g.host, remote, M->mode);
+                goto out;
+        }
+        all = 1;
         Da_foreach(e, have)
         {
                 Da_append(&names, strdup(e->name));
@@ -1336,6 +1347,7 @@ out:
         sftp_dir_free(&have);
         free((void *) local);
         free((void *) remote);
+        return all;
 }
 
 /* ---- the walk: doing the steps ----------------------------------------------
@@ -1411,7 +1423,7 @@ plan_dir(Walk *w, const char *rel, const State *L, const State *M, const State *
 
         if (dc == DIR_BOTH) {
                 int is_new = R->type != 'd';
-                if (deep || is_new) plan_children(w, rel);
+                int all    = !(deep || is_new) || plan_children(w, rel, M);
                 /* Last: a read-only mode would stop the steps inside */
                 State st = *L;
                 uint32_t mode;
@@ -1421,7 +1433,7 @@ plan_dir(Walk *w, const char *rel, const State *L, const State *M, const State *
                         plan_add(plan, ACT_MODE, up, rel, L, M, &st);
                 }
                 plan_add(plan, ACT_RECORD, 0, rel, L, M, &st);
-                return deep || is_new;
+                return all && (deep || is_new);
         }
         if (*rel == 0) {
                 LOG_WARN("'%s' is missing on one side, not touching it", w->root->local);
@@ -1439,8 +1451,12 @@ plan_dir(Walk *w, const char *rel, const State *L, const State *M, const State *
                  * kept (an edit beats a deletion) and the rest is removed. If
                  * nothing is kept, the directory goes too. */
                 int kept = plan_keeps(w, ld);
-                plan_children(w, rel);
-                if (plan_keeps(w, ld) > kept) {
+                int all  = plan_children(w, rel, M);
+                if (!all) {
+                        /* What's inside couldn't be looked at: both sides
+                         * stay as they are, and the error is said above */
+                        plan_add(plan, ACT_RECORD, 0, rel, L, M, D);
+                } else if (plan_keeps(w, ld) > kept) {
                         plan_add(plan, ACT_MODE, ld, rel, L, M, D); // made again for what's kept
                         plan->items[plan->count - 1].quiet = 1;
                         plan_add(plan, ACT_RECORD, 0, rel, L, M, D);
@@ -1460,7 +1476,7 @@ plan_dir(Walk *w, const char *rel, const State *L, const State *M, const State *
                         apply_ready(w);
                         batch_flush(w);
                 }
-                plan_children(w, rel);
+                plan_children(w, rel, M);
                 plan_add(plan, ACT_MODE, ld, rel, L, M, D);
                 plan->items[plan->count - 1].quiet = 1;
                 plan_add(plan, ACT_RECORD, 0, rel, L, M, D);

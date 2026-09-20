@@ -6,6 +6,9 @@
 Every chunk is delivered RTT_MS/2 after it was sent, in order, both ways, so a
 request and its reply take RTT_MS. Used by fake-ssh for ISF_TEST_LATENCY_MS.
 
+With $ISF_TEST_BANDWIDTH_KBPS, the line also carries only that many KB a
+second in each direction.
+
 With $ISF_TEST_SFTP_LOG, it also counts the SFTP requests going by, by type,
 and the rounds: how many times a request went out after a reply came back
 (requests sent together are one round, one after another, one each). The
@@ -15,6 +18,7 @@ the end, not let finish.
 
 It exits with PROGRAM's exit status."""
 
+import fcntl
 import os
 import subprocess
 import sys
@@ -64,10 +68,37 @@ class Counter:
                 f.write(" ".join(f"{k}={v}" for k, v in sorted(self.counts.items())) + "\n")
 
 
-def relay(src, dst, delay, seen=None, close=None):
+# One line for everything isf opens: each chunk takes its turn on it, so the
+# rate is the whole machine's, not each session's. $ISF_TEST_LINE holds when
+# the line is free again, under a lock.
+LINE = os.environ.get("ISF_TEST_LINE")
+line_lock = threading.Lock()
+
+
+def reserve(span, due):
+    """Take SPAN seconds of the line, not before DUE. Returns when the last
+    byte lands."""
+    with line_lock:
+        if not LINE:
+            return due + span
+        with open(LINE, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            free = float(f.read() or 0)
+            end = max(free, due, time.monotonic()) + span
+            f.seek(0)
+            f.truncate()
+            f.write(str(end))
+            f.flush()
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return end
+
+
+def relay(src, dst, delay, seen=None, close=None, rate=0):
     """Copy src to dst, each chunk DELAY seconds after it arrived, telling
     SEEN about each chunk as it arrives. At the end, dst is closed (with
-    CLOSE, if it belongs to a file object)"""
+    CLOSE, if it belongs to a file object). With RATE (bytes a second), the
+    chunks also queue behind each other, as they would on a slow line."""
     queue = []
     cond = threading.Condition()
     done = False
@@ -95,6 +126,8 @@ def relay(src, dst, delay, seen=None, close=None):
             if not queue:
                 break
             due, data = queue.pop(0)
+        if rate:
+            due = reserve(len(data) / rate, due)
         wait = due - time.monotonic()
         if wait > 0:
             time.sleep(wait)
@@ -110,12 +143,14 @@ def relay(src, dst, delay, seen=None, close=None):
 
 def main():
     delay = int(sys.argv[1] or 0) / 2000
+    rate = float(os.environ.get("ISF_TEST_BANDWIDTH_KBPS") or 0) * 1024
     counter = Counter(os.environ["ISF_TEST_SFTP_LOG"]) if os.environ.get("ISF_TEST_SFTP_LOG") else None
     child = subprocess.Popen(sys.argv[2:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     assert child.stdin and child.stdout
-    up = threading.Thread(target=relay, args=(0, child.stdin.fileno(), delay, counter and counter.requests, child.stdin.close))
+    up = threading.Thread(target=relay,
+                          args=(0, child.stdin.fileno(), delay, counter and counter.requests, child.stdin.close, rate))
     up.start()
-    relay(child.stdout.fileno(), 1, delay, counter and (lambda _data: counter.reply()))
+    relay(child.stdout.fileno(), 1, delay, counter and (lambda _data: counter.reply()), None, rate)
     sys.exit(child.wait())
 
 

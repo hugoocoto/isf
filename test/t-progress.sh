@@ -35,12 +35,13 @@ grep -qaE $'\r\e\\[Kisf: already in sync' "$T/out" || fail "the status line wasn
 # A slow sync on a terminal (script gives isf one): a status line, rewritten in
 # place, that goes before the summary
 rm -rf "$L/d1" "$R/d1"
-head -c 10000000 /dev/urandom >"$L/big"
-export ISF_TEST_LATENCY_MS=200
+head -c 6000000 /dev/urandom >"$L/big"
+# A line slow enough that sending it takes a while, whatever the engine does
+export ISF_TEST_LATENCY_MS=200 ISF_TEST_BANDWIDTH_KBPS=4000
 (cd "$T/local" && exec setsid script -qfec "exec '$ISF' ./proj -I '$ISF'" /dev/null >"$T/out" 2>"$T/err") &
 PID=$!
-WAIT=20 wait_for 'grep -q "watching for changes" "$T/out"'
-grep -qaE $'\r\e\\[Kisf: 0 of 1 file, [0-9.]+ of 9.5 MB' "$T/out" || fail "no status line"
+WAIT=60 wait_for 'grep -q "watching for changes" "$T/out"'
+grep -qaE $'\r\e\\[Kisf: 0 of 1 file, [0-9.]+ of 5.7 MB' "$T/out" || fail "no status line"
 grep -qaE $'\r\e\\[K  ↑ big' "$T/out" || fail "the status line wasn't cleared"
 grep -zqaE '↑ big[[:space:]]+isf: 1 of 1 file,' "$T/out" || fail "the status line under it didn't count it"
 # isf is script's child, in its own session: stop it like stop() does

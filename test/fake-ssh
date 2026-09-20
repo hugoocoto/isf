@@ -3,12 +3,16 @@
 # $ISF_TEST_REMOTE as its home. isf runs ssh two ways:
 #   ssh [opts] -s -- HOST sftp        an SFTP session
 #   ssh [opts] -- HOST 'CMD'          the agent
+# With $ISF_TEST_BANDWIDTH_KBPS, the line carries that many KB a second.
 # With $ISF_TEST_LATENCY_MS, the traffic of both is delayed by that round
 # trip, and with $ISF_TEST_SFTP_LOG the SFTP requests are counted (see
 # latency.py).
 # $ISF_TEST_SFTP_FLAGS go to sftp-server (like -P posix-rename, to refuse it).
 # Sessions start in $ISF_TEST_REMOTE, which the "remote" paths start from.
 # $ISF_TEST_REMOTE/../down makes it unreachable (like ssh, exit status 255).
+
+# One line shared by every session isf opens (see latency.py)
+export ISF_TEST_LINE="$ISF_TEST_REMOTE/../line"
 
 subsystem=0
 while [ $# -gt 0 ]; do
@@ -37,13 +41,13 @@ if [ $subsystem = 1 ]; then
                 [ $i -le "$ISF_TEST_SFTP_LIMIT" ] || { echo "fake-ssh: session refused" >&2; exit 255; }
         fi
         # shellcheck disable=SC2086 # the flags are words
-        if [ -n "${ISF_TEST_LATENCY_MS:-}${ISF_TEST_SFTP_LOG:-}" ]; then
+        if [ -n "${ISF_TEST_LATENCY_MS:-}${ISF_TEST_SFTP_LOG:-}${ISF_TEST_BANDWIDTH_KBPS:-}" ]; then
                 exec python3 "$(dirname "$(readlink -f "$0")")/latency.py" "${ISF_TEST_LATENCY_MS:-0}" \
                         "$SFTP_SERVER" ${ISF_TEST_SFTP_FLAGS:-}
         fi
         exec "$SFTP_SERVER" ${ISF_TEST_SFTP_FLAGS:-}
 fi
-if [ -n "${ISF_TEST_LATENCY_MS:-}" ]; then
-        ISF_TEST_SFTP_LOG= exec python3 "$(dirname "$(readlink -f "$0")")/latency.py" "$ISF_TEST_LATENCY_MS" sh -c "$*"
+if [ -n "${ISF_TEST_LATENCY_MS:-}${ISF_TEST_BANDWIDTH_KBPS:-}" ]; then
+        ISF_TEST_SFTP_LOG= exec python3 "$(dirname "$(readlink -f "$0")")/latency.py" "${ISF_TEST_LATENCY_MS:-0}" sh -c "$*"
 fi
 exec sh -c "$*"

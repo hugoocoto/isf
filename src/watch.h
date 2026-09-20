@@ -18,7 +18,13 @@ typedef struct watch {
 
 /* Start inotify (nonblocking). Returns its fd, or -1 (logged). */
 int watch_init(void);
-/* Watch PATH and every directory below it, as part of folder ROOT */
+/* Don't watch the folders SKIP says to skip (nor anything below them): the
+ * ignored ones, whose events are dropped anyway, and which can be huge
+ * (node_modules). A folder it skips that is watched is let go. NULL (the
+ * default) watches everything. */
+void watch_skip(int (*skip)(int root, const char *path));
+/* Watch PATH and every directory below it, as part of folder ROOT. Called
+ * again after the patterns change, to watch what they don't skip anymore. */
 int listen_folder(const char *path, int root, int fd);
 /* The watch an event is for, NULL if it was removed already */
 Watch *find_watch(int wd);

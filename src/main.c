@@ -392,6 +392,7 @@ flush(void)
                                 if (sync_stats().sent != sent) sync_forget_seed(root);
                                 ignore_load(&root->ign, root->local);
                                 g.ign_stamp[i] = ignore_stamp(root);
+                                listen_folder(root->local, i, g.fd); // what isn't skipped now
                                 mark(i, "", SYNC_TREE);
                         }
 
@@ -439,6 +440,7 @@ flush(void)
                 if (ignore_stamp(root) == g.ign_stamp[i]) continue;
                 ignore_load(&root->ign, root->local);
                 g.ign_stamp[i] = ignore_stamp(root);
+                listen_folder(root->local, i, g.fd); // what isn't skipped now
                 mark(i, "", SYNC_TREE);
         }
 }
@@ -820,6 +822,17 @@ held_local(const char *path, int root)
         mark_local(root, path, rel_path(g.roots.items[root].local, path), SYNC_DATA);
 }
 
+/* An ignored folder isn't watched: its events are dropped anyway, and a big
+ * one would use thousands of watches. What stops being ignored is watched
+ * when the patterns are loaded again (flush). */
+static int
+skip_watch(int root, const char *path)
+{
+        Root *r         = &g.roots.items[root];
+        const char *rel = rel_path(r->local, path);
+        return *rel && ignored(&r->ign, rel, 1);
+}
+
 /* sync made a local directory: watch it now, before anything goes in it,
  * so its own event needn't send for all of it */
 static void
@@ -1138,6 +1151,7 @@ main(int argc, char **argv)
         int fd = watch_init();
         if (fd < 0) return 1;
         g.fd = fd;
+        watch_skip(skip_watch);
         sync_on_local_dir(watch_new_dir);
         sync_on_place(place_files); // the agent puts what isf sends in place
 

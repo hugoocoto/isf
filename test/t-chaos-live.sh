@@ -7,7 +7,8 @@ SEED=${SEED:-3}
 ROUNDS=${ROUNDS:-10}
 RANDOM=$SEED
 WAIT=60
-[ -n "${LAT:-}" ] && export ISF_TEST_LATENCY_MS=$LAT # changes land mid-transfer
+[ -n "${LAT:-}" ] && export ISF_TEST_LATENCY_MS=$LAT  # changes land mid-transfer
+[ -n "${KBPS:-}" ] && export ISF_TEST_BANDWIDTH_KBPS=$KBPS # ... on a slow line
 mkdir -p "$R"
 names=(a b c d dir/x dir/y deep/one/two deep/one/three)
 log=$T/chaos.log
@@ -33,8 +34,9 @@ for round in $(seq "$ROUNDS"); do
                         3) mkdir -p "$path" 2>/dev/null && echo "round $round: mkdir $path" >>"$log" ;;
                         4) [ -e "$path" ] && mv "$path" "$path.moved" 2>/dev/null &&
                                 echo "round $round: move $path" >>"$log" ;;
-                        5) [ -e "$path" ] && chmod "$((RANDOM % 2 ? 755 : 644))" "$path" 2>/dev/null &&
-                                echo "round $round: chmod $path" >>"$log" ;;
+                        5) if [ -d "$path" ]; then mode=$((RANDOM % 2 ? 755 : 700)); else mode=$((RANDOM % 2 ? 644 : 600)); fi
+                                [ -e "$path" ] && chmod "$mode" "$path" 2>/dev/null &&
+                                        echo "round $round: chmod $mode $path" >>"$log" ;;
                         6) mkdir -p "$(dirname "$path")" && rm -rf "$path" 2>/dev/null
                                 ln -s "../$((RANDOM % 5))-target" "$path" 2>/dev/null &&
                                         echo "round $round: symlink $path" >>"$log" ;;
