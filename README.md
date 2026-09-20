@@ -115,12 +115,21 @@ With several folders, paths start with the folder they are in. A sync that
 takes more than a couple of seconds also shows how far it got, on a line that
 stays at the bottom.
 
+## What it syncs
+
+Files, folders and symlinks — symlinks as symlinks, without following what
+they point at — with their permissions and modification times. Not owners or
+groups, and not hard links: two names for one file become two files on the
+other side. Anything else (sockets, fifos, devices) is skipped with an error.
+
 ## How changes are decided
 
 - If something changed on one side only, that side wins.
 - If it changed on both, the newest modification time wins, and the other
   version is kept next to it as `FILE.isf-conflict` on both sides.
 - If one side deleted it and the other edited it, the edit wins.
+- A file that is kept open while it's written (a log) is synced once the
+  writes stop for a couple of seconds, not at every write.
 - The first time a folder is synced, files that exist on only one side are
   copied, and files that differ on both are treated as changed on both.
 
@@ -129,8 +138,8 @@ isf says so at the start if they disagree.
 
 ## Ignoring files
 
-Put patterns in a `.isfignore` file in the synced folder, one per line, like
-`.gitignore`:
+Put patterns in a `.isfignore` file at the top of the synced folder, one per
+line, like `.gitignore` (only that one is read, not any deeper down):
 
 ```
 # any name that matches, in any directory
@@ -159,6 +168,8 @@ they are, but aren't synced anymore.
   isf stops instead of deleting everything on the other side. If that side
   was emptied by mistake, `isf --reset` copies everything back.
 - Only one isf syncs a given folder to a given place at a time.
+- If the connection drops, isf connects again when it can, and syncs what
+  changed meanwhile on either side.
 - `isf -n` shows what a sync would do without doing it.
 
 ## Where isf keeps its things
@@ -174,12 +185,10 @@ ssh connection socket lives in `$XDG_RUNTIME_DIR/isf-*` (or `~/.ssh/isf-*`).
   modification time in whole seconds: an edit that kept the size, in the same
   second as the last sync, can be missed. Changes made while isf runs, and
   local changes, don't have this problem.
-- A file written to and kept open (a log) is synced once the writes stop for
-  2 seconds, and every 30 seconds while they don't.
 - A folder renamed while isf wasn't running is sent again, not renamed.
-- Ignored folders are still watched, so a huge ignored folder uses many
-  inotify watches; on a small remote they can run out (isf says so).
-- If the connection drops, isf connects again when it can and syncs what
-  changed meanwhile on either side.
 - isf runs in the foreground, one host at a time.
+- Each side watches every folder it syncs, and Linux limits how many watches
+  a user gets: a tree of many thousands of folders can run out on a small
+  machine. isf says so, and how to raise the limit. (Ignored folders don't
+  count: they aren't watched.)
 - IPv6 addresses need a host alias in `~/.ssh/config`.
