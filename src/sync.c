@@ -1991,22 +1991,11 @@ expect(Root *root, const char *rel, const State *st)
         e->when = time(NULL);
 }
 
-void
-sync_remote_seen(Root *root, const char *rel, const State *seen, char kind)
+/* REL there is as isf just made it: the agent reporting isf's own doing back.
+ * An expectation is only good once, so a match takes it. */
+static int
+expected(Root *root, const char *rel, const State *seen)
 {
-        State *s = bt_get(&root->seen, rel);
-        if (s == NULL) {
-                s = calloc(1, sizeof *s);
-                assert(s);
-                bt_add(&root->seen, rel, s);
-        }
-        int written = s->written;
-        *s          = *seen;
-        s->link     = NULL;
-        s->written  = written;
-        if (kind != 'C') return; // isf's own write, or only attributes
-
-        /* A write: someone else's, unless it's what isf just did there */
         Expect *e = bt_get(&root->expect, rel);
         for (int i = 0; e && i < e->count; i++) {
                 const State *x = &e->st[i];
@@ -2018,9 +2007,40 @@ sync_remote_seen(Root *root, const char *rel, const State *seen, char kind)
                         bt_del(&root->expect, rel);
                         free(e);
                 }
+                return 1;
+        }
+        return 0;
+}
+
+void
+sync_remote_seen(Root *root, const char *rel, const State *seen, char kind)
+{
+        /* isf's own doing, come back (its uploads the agent tells apart by
+         * itself, as 'W'). The agent saw the path as isf left it then, not as
+         * whatever isf did to it next: a file it kept aside as a conflict
+         * copy is reported gone, and the directory it put there instead only
+         * afterwards. Taking the report for the remote's state would leave
+         * the plan a step behind and undo that step (it deleted the directory
+         * here). Forget what was seen of the path instead: this walk looks at
+         * it once, and sees what is there. */
+        if (kind != 'W' && expected(root, rel, seen)) {
+                free(bt_get(&root->seen, rel));
+                bt_del(&root->seen, rel);
                 return;
         }
-        s->written = 1;
+
+        State *s = bt_get(&root->seen, rel);
+        if (s == NULL) {
+                s = calloc(1, sizeof *s);
+                assert(s);
+                bt_add(&root->seen, rel, s);
+        }
+        int written = s->written;
+        *s          = *seen;
+        s->link     = NULL;
+        /* A write nothing expected is someone else's ('W' is isf's own, 'A'
+         * and 'D' aren't writes) */
+        s->written  = written || kind == 'C';
 }
 
 void

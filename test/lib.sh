@@ -6,6 +6,7 @@ set -u
 
 TOP=$(cd "$(dirname "$0")/.." && pwd)
 ISF=${ISF:-$TOP/isf}
+# $AGENT is what isf runs on the remote (-I): $ISF, or a stand-in in a test
 T=$(mktemp -d "${TMPDIR:-/tmp}/isf-test.XXXXXX")
 L=$T/local/proj
 R=$T/home/proj
@@ -50,7 +51,7 @@ start() {
         : >"$T/out"
         : >"$T/err"
         # Its own process group, so stop() gets the ssh children too
-        (cd "$T/local" && exec setsid "$ISF" "$@" -I "$ISF" >"$T/out" 2>"$T/err") &
+        (cd "$T/local" && exec setsid "$ISF" "$@" -I "${AGENT:-$ISF}" >"$T/out" 2>"$T/err") &
         PID=$!
         local end=$((SECONDS + WAIT))
         while [ $SECONDS -lt $end ]; do
@@ -79,7 +80,7 @@ check_sanitizers() {
 # within $RUN_TIMEOUT seconds (20 by default; raise it on a slow line).
 # Sets $STATUS.
 run() {
-        (cd "$T/local" && exec timeout "${RUN_TIMEOUT:-20}" "$ISF" "$@" -I "$ISF") >"$T/out" 2>"$T/err"
+        (cd "$T/local" && exec timeout "${RUN_TIMEOUT:-20}" "$ISF" "$@" -I "${AGENT:-$ISF}") >"$T/out" 2>"$T/err"
         STATUS=$?
         check_sanitizers
 }
