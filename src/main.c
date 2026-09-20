@@ -268,6 +268,18 @@ parse_args(int argc, char **argv)
                         fprintf(stderr, "isf: '%s' isn't a folder\n", local);
                         return 1;
                 }
+                /* A symlink to a folder: the folder it points at is the one
+                 * to sync. Everything else looks at paths without following
+                 * them, and would see a symlink where it wants a folder. */
+                struct stat self;
+                if (lstat(local, &self) == 0 && S_ISLNK(self.st_mode)) {
+                        char *real = realpath(local, NULL);
+                        if (real == NULL) {
+                                LOG_ERR("Cannot tell what '%s' points at", local);
+                                return 1;
+                        }
+                        local = real;
+                }
 
                 Dest d = { 0 }, before = { 0 };
                 if (host) {

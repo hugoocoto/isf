@@ -4,6 +4,16 @@
 . "$(dirname "$0")/lib.sh"
 
 mkdir -p "$R"
+
+# The folder to sync, given as a symlink: what it points at is synced
+mkdir -p "$T/local/real" && echo x >"$T/local/real/f"
+ln -s real "$T/local/aslink"
+echo there >"$T/home/linked/g" 2>/dev/null || mkdir -p "$T/home/linked" && echo there >"$T/home/linked/g"
+(cd "$T/local" && exec timeout 20 "$ISF" ./aslink host:linked -I "$ISF" --once) >"$T/out" 2>"$T/err"
+[ $? = 0 ] || fail "a folder given as a symlink didn't sync: $(head -2 "$T/err")"
+expect_file "$T/home/linked/f" x
+expect_file "$T/local/real/g" there
+
 ln -s nowhere "$L/dangling"          # points at nothing
 ln -s ../outside "$L/outside"        # out of the folder
 ln -s real "$L/rel"                  # inside the folder

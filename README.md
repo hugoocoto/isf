@@ -118,7 +118,8 @@ stays at the bottom.
 ## What it syncs
 
 Files, folders and symlinks — symlinks as symlinks, without following what
-they point at — with their permissions and modification times. Not owners or
+they point at — with their permissions and modification times. (A folder you
+give it on the command line may be a symlink: that one is followed.) Not owners or
 groups, and not hard links: two names for one file become two files on the
 other side. Anything else (sockets, fifos, devices) is skipped with an error.
 

@@ -1,5 +1,6 @@
-/* Fuzz what comes from the other side: the agent's messages and the SFTP
- * server's replies, which a broken or hostile remote could make up.
+/* Fuzz what comes from the other side: the agent's messages, the SFTP
+ * server's replies and the .isfignore it sends, which a broken or hostile
+ * remote could make up.
  *
  *     make fuzz CC=clang && test/fuzz -max_total_time=60
  *
@@ -13,6 +14,7 @@
 #include <unistd.h>
 
 #include "agent.h"
+#include "ignore.h"
 #include "sftp.h"
 #include "sync.h"
 #include "util.h"
@@ -92,6 +94,38 @@ fuzz_sftp(const uint8_t *data, size_t size)
         close(sink);
 }
 
+/* The .isfignore of a folder comes from the other side like everything else:
+ * whatever is in it, loading it and asking about paths must hold up. */
+static void
+fuzz_ignore(const uint8_t *data, size_t size)
+{
+        char dir[] = "/tmp/isf-fuzz.XXXXXX";
+        if (mkdtemp(dir) == NULL) return;
+        char path[64];
+        snprintf(path, sizeof path, "%s/%s", dir, IGNORE_FILE);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd != -1) {
+                ssize_t n = write(fd, data, size);
+                (void) n;
+                close(fd);
+        }
+
+        Ignore ign = { 0 };
+        ignore_load(&ign, dir);
+        static const char *const paths[] = { "", "a", "a/b", "a/b/c.log", ".hidden", "d/", "x/y/z/deep" };
+        for (size_t i = 0; i < sizeof paths / sizeof *paths; i++) {
+                ignored(&ign, paths[i], 0);
+                ignored(&ign, paths[i], 1);
+        }
+        Da_foreach(pat, ign)
+        {
+                free(pat->pattern);
+        }
+        Da_destroy(&ign);
+        unlink(path);
+        rmdir(dir);
+}
+
 int
 LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
@@ -101,9 +135,10 @@ LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 quiet = 1;
         }
         if (size < 1) return 0;
-        if (data[0] & 1)
-                fuzz_agent(data + 1, size - 1);
-        else
-                fuzz_sftp(data + 1, size - 1);
+        switch (data[0] % 3) {
+        case 0: fuzz_agent(data + 1, size - 1); break;
+        case 1: fuzz_sftp(data + 1, size - 1); break;
+        default: fuzz_ignore(data + 1, size - 1); break;
+        }
         return 0;
 }
