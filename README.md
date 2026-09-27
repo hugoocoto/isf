@@ -187,6 +187,9 @@ ssh connection socket lives in `$XDG_RUNTIME_DIR/isf-*` (or `~/.ssh/isf-*`).
   second as the last sync, can be missed. Changes made while isf runs, and
   local changes, don't have this problem.
 - A folder renamed while isf wasn't running is sent again, not renamed.
+- If the remote folder is on a network filesystem (NFS, Lustre, SMB...), what
+  other machines change in it (a cluster's compute nodes) raises no event on
+  the remote: isf looks for it every 5 seconds, so it arrives a bit later.
 - isf runs in the foreground, one host at a time.
 - Each side watches every folder it syncs, and Linux limits how many watches
   a user gets: a tree of many thousands of folders can run out on a small

@@ -8,14 +8,29 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "agent.h"
+#include "bt.h"
 #include "ignore.h"
 #include "sftp.h"
 #include "watch.h"
+
+/* How often a folder on a network filesystem is looked at, at least (see
+ * poll_scan) */
+#define POLL_MS 5000
+
+/* A folder on a network filesystem: what changes in it from another machine
+ * (a cluster's compute nodes writing to an NFS home) is no inotify event here,
+ * so it is looked for by walking the folder every so often */
+typedef struct {
+        int on;
+        BT snap;   // rel -> what was last seen or reported of it (snap_text)
+        long next; // when to look again (now_ms)
+} Poll;
 
 /* Remote side: the folders it watches */
 static struct {
@@ -34,7 +49,18 @@ static struct {
                 int is_dir;
         } move;
         int fd; // inotify's
+        Poll *poll;  // one per folder
+        int poll_ms; // how often, at least
+        int whole;   // the walk under way could look at everything
 } g;
+
+static long
+now_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 /* Is COOKIE a rename from one of isf's temp files? (Forgotten then.) */
 static int
@@ -65,6 +91,124 @@ lstat_text(const char *path, char *buf)
         stat_text(&st, buf);
 }
 
+/* What HEX says (the local side's, further down) */
+static int hex(const char *s, int n, uint64_t *v);
+
+/* ST as the polling snapshot keeps it: stat_text, but a directory's size and
+ * mtime left out. They change with what's in it, which is compared on its own,
+ * and isf's own uploads would make them differ. */
+static void
+snap_text(const struct stat *st, char *buf)
+{
+        struct stat s = *st;
+        if (S_ISDIR(s.st_mode)) {
+                s.st_size  = 0;
+                s.st_mtime = 0;
+        }
+        stat_text(&s, buf);
+}
+
+/* Is TEXT (stat_text) a directory's? */
+static int
+text_is_dir(const char *text)
+{
+        uint64_t mode = 0;
+        return hex(text + 24, 8, &mode) && S_ISDIR(mode);
+}
+
+/* REL is TEXT now, in SNAP */
+static void
+snap_put(BT *snap, const char *rel, const char *text)
+{
+        char *old = bt_get(snap, rel);
+        if (old) {
+                memcpy(old, text, 33);
+                return;
+        }
+        char *copy = strdup(text);
+        assert(copy);
+        bt_add(snap, rel, copy);
+}
+
+/* REL is gone from SNAP, and what was in it if it's a directory */
+static void
+snap_forget(BT *snap, const char *rel)
+{
+        char *old = bt_get(snap, rel);
+        if (old == NULL) return;
+        int dir = text_is_dir(old);
+        free(old);
+        bt_del(snap, rel);
+        if (!dir) return;
+
+        /* Copies: deleting moves keys between nodes */
+        size_t n = strlen(rel);
+        Da(char *) below = { 0 };
+        BT *e;
+        for_bt_each(e, snap)
+        {
+                if (!strncmp(e->key, rel, n) && e->key[n] == '/') Da_append(&below, strdup(e->key));
+        }
+        Da_foreach(k, below)
+        {
+                free(bt_get(snap, *k));
+                bt_del(snap, *k);
+                free(*k);
+        }
+        Da_destroy(&below);
+}
+
+/* Put what's under PATH, a folder in ROOT_I, into SNAP: everything but temp
+ * files and what's ignored. A walk that couldn't look at something clears
+ * g.whole: what it missed isn't gone. */
+static void
+snap_walk(int root_i, const char *path, BT *snap)
+{
+        DIR *dir = opendir(path);
+        if (dir == NULL) {
+                if (errno != ENOENT) g.whole = 0;
+                return;
+        }
+        const Root *root = &g.roots[root_i];
+        struct dirent *e;
+        while ((e = readdir(dir))) {
+                if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || is_temp_name(e->d_name)) continue;
+                char *child = (char *) pathjoin(path, e->d_name);
+                const char *rel = rel_path(root->local, child);
+                struct stat st;
+                if (lstat(child, &st) == -1) {
+                        if (errno != ENOENT) g.whole = 0; // gone meanwhile is fine
+                } else if (!ignored(&root->ign, rel, S_ISDIR(st.st_mode))) {
+                        char text[33];
+                        snap_text(&st, text);
+                        snap_put(snap, rel, text);
+                        if (S_ISDIR(st.st_mode)) snap_walk(root_i, child, snap);
+                }
+                free(child);
+        }
+        closedir(dir);
+}
+
+/* PATH (REL in ROOT_I) was reported as ST (all 0: gone): the next walk
+ * compares against that, so nothing is reported twice */
+static void
+snap_note(int root_i, const char *path, const char *rel, const struct stat *st)
+{
+        if (g.poll == NULL || !g.poll[root_i].on || !*rel) return;
+        BT *snap = &g.poll[root_i].snap;
+        if (st->st_mode == 0) {
+                snap_forget(snap, rel);
+                return;
+        }
+        char text[33];
+        snap_text(st, text);
+        const char *old = bt_get(snap, rel);
+        int was_dir     = old && text_is_dir(old);
+        snap_put(snap, rel, text);
+        /* A folder new here: what's in it has no events of its own */
+        if (S_ISDIR(st->st_mode) && !was_dir) snap_walk(root_i, path, snap);
+}
+
 /* Tell the other side: TYPE, ROOT, VALUE and TEXT (see agent.h) */
 static void
 agent_send(char type, int root, uint64_t value, const char *text)
@@ -92,7 +236,10 @@ agent_change(char kind, int root, const char *path)
         const char *rel = rel_path(g.roots[root].local, path);
         char *text      = malloc(strlen(rel) + 33);
         assert(text);
-        lstat_text(path, text);
+        struct stat st;
+        if (lstat(path, &st) == -1) memset(&st, 0, sizeof st);
+        stat_text(&st, text);
+        snap_note(root, path, rel, &st);
         strcat(text, rel);
         agent_send(kind, root, 0, text);
         free(text);
@@ -251,9 +398,6 @@ place(int root_i, uint64_t id, const char *expect, const char *tmp_rel, const ch
         free((void *) target);
 }
 
-/* What HEX says (the local side's, further down) */
-static int hex(const char *s, int n, uint64_t *v);
-
 /* Read what the other side asks (its 'P' requests) and answer. Returns 1 when
  * it's gone (its end of the pipe closed), which stops the agent. */
 static int
@@ -362,7 +506,11 @@ agent_event(const struct inotify_event *event, int fd)
                 const char *to   = rel_path(root->local, path);
                 char *text       = malloc(strlen(from) + strlen(to) + 33);
                 assert(text);
-                lstat_text(path, text);
+                struct stat st;
+                if (lstat(path, &st) == -1) memset(&st, 0, sizeof st);
+                stat_text(&st, text);
+                if (g.poll && g.poll[root_i].on) snap_forget(&g.poll[root_i].snap, from);
+                snap_note(root_i, path, to, &st);
                 strcat(strcat(text, from), to);
                 agent_send('M', root_i, strlen(from), text);
                 free(text);
@@ -386,6 +534,126 @@ agent_event(const struct inotify_event *event, int fd)
         free((void *) path);
 }
 
+/* Is PATH on a filesystem that other machines write to directly? Their
+ * changes reach this kernel without going through it, so inotify never hears
+ * of them. FUSE is left out: most of it is local. */
+static int
+on_network_fs(const char *path)
+{
+        struct statfs sf;
+        if (statfs(path, &sf) == -1) return 0;
+        switch ((uint32_t) sf.f_type) {
+        case 0x6969:     // NFS
+        case 0x517B:     // SMB
+        case 0xFF534D42: // CIFS
+        case 0xFE534D42: // SMB2
+        case 0x0BD00BD0: // Lustre
+        case 0x47504653: // GPFS
+        case 0x00C36400: // Ceph
+        case 0x5346414F: // AFS
+        case 0x19830326: // BeeGFS
+        case 0x01021997: // 9p
+                return 1;
+        }
+        return 0;
+}
+
+/* A path the walk found different from what was last seen or reported:
+ * TEXT is what it is now (unused if GONE) */
+typedef struct {
+        char *rel;
+        char text[33];
+        int gone;
+} Found;
+
+/* Walk folder ROOT_I and report what changed since the last walk that no
+ * event reported: what other machines did. */
+static void
+poll_scan(int root_i)
+{
+        Poll *p          = &g.poll[root_i];
+        const Root *root = &g.roots[root_i];
+        BT now           = { 0 };
+        g.whole          = 1;
+        snap_walk(root_i, root->local, &now);
+
+        Da(Found) found = { 0 };
+        BT *e;
+        for_bt_each(e, &now)
+        {
+                const char *old = bt_get(&p->snap, e->key);
+                if (old && !strcmp(old, e->value)) continue;
+                Found f = { .rel = strdup(e->key) };
+                memcpy(f.text, e->value, 33);
+                Da_append(&found, f);
+        }
+        /* A walk that missed something would take it for gone */
+        if (g.whole) {
+                for_bt_each(e, &p->snap)
+                {
+                        if (!bt_get(&now, e->key)) Da_append(&found, ((Found) { .rel = strdup(e->key), .gone = 1 }));
+                }
+        }
+        for_bt_each(e, &now)
+        {
+                free(e->value);
+        }
+        bt_destroy(&now);
+
+        /* A change made on this machine, isf's own uploads included, was
+         * queued as an event before the walk could see it: those say who did
+         * it, so they go first, and what they report isn't reported again */
+        handle_events(g.fd, agent_event);
+
+        Da_foreach(f, found)
+        {
+                const char *old = bt_get(&p->snap, f->rel);
+                int reported    = f->gone ? old == NULL : old && !strcmp(old, f->text);
+                if (!reported) {
+                        const char *path = root_join(root->local, f->rel);
+                        int dir          = (old && text_is_dir(old)) || (!f->gone && text_is_dir(f->text));
+                        /* Only the mode changed: attributes, not a write */
+                        int attrs = old && !f->gone && !dir && !strncmp(old, f->text, 24);
+                        if (dir && !f->gone) listen_folder(path, root_i, g.fd);
+                        agent_change(dir ? 'D' : attrs ? 'A' : 'C', root_i, path);
+                        if (!strcmp(f->rel, IGNORE_FILE)) {
+                                ignore_load(&g.roots[root_i].ign, root->local);
+                                listen_folder(root->local, root_i, g.fd);
+                        }
+                        free((void *) path);
+                }
+                free(f->rel);
+        }
+        Da_destroy(&found);
+}
+
+/* Milliseconds until a folder is due to be walked, -1 if none is polled */
+static int
+poll_timeout(void)
+{
+        long wait = -1, now = now_ms();
+        for (int i = 0; i < g.count; i++) {
+                if (!g.poll[i].on) continue;
+                long left = g.poll[i].next > now ? g.poll[i].next - now : 0;
+                if (wait < 0 || left < wait) wait = left;
+        }
+        return (int) wait;
+}
+
+/* Walk the folders that are due. A slow walk (a big tree on a busy server)
+ * waits ten times as long as it took before the next one. */
+static void
+poll_due(void)
+{
+        for (int i = 0; i < g.count; i++) {
+                long start = now_ms();
+                if (!g.poll[i].on || start < g.poll[i].next) continue;
+                poll_scan(i);
+                long took      = now_ms() - start;
+                g.poll[i].next = now_ms() + (10 * took > g.poll_ms ? 10 * took : g.poll_ms);
+        }
+}
+
 int
 agent_main(Root *roots, int count)
 {
@@ -407,6 +675,22 @@ agent_main(Root *roots, int count)
         for (int i = 0; i < count; i++) {
                 if (listen_folder(roots[i].local, i, fd)) return 1;
         }
+        /* Folders other machines write to are also walked every so often.
+         * ISF_TEST_POLL_MS walks every folder, that often (the tests' folders
+         * aren't on one). Their first snapshot comes before the listings, so
+         * a change made in between is found by the first walk. */
+        const char *test_poll = getenv("ISF_TEST_POLL_MS");
+        g.poll_ms             = test_poll && atoi(test_poll) > 0 ? atoi(test_poll) : POLL_MS;
+        g.poll                = calloc(count, sizeof *g.poll);
+        assert(g.poll);
+        for (int i = 0; i < count; i++) {
+                if (!(test_poll && atoi(test_poll) > 0) && !on_network_fs(roots[i].local)) continue;
+                g.poll[i].on   = 1;
+                g.poll[i].next = now_ms() + g.poll_ms;
+                snap_walk(i, roots[i].local, &g.poll[i].snap);
+                VPRINT("'%s' is on a network filesystem: looking for changes made from other machines every %d ms\n",
+                       roots[i].local, g.poll_ms);
+        }
         /* What's there now, for the first walk of the other side. Not what
          * its .isfignore here ignores: the other side lists that itself, if
          * its own .isfignore doesn't. */
@@ -421,22 +705,27 @@ agent_main(Root *roots, int count)
                 { .fd = STDIN_FILENO, .events = POLLIN },
         };
         for (;;) {
-                /* A MOVED_FROM waits for its MOVED_TO only so long, and a
-                 * file held open until it's due */
-                int wait     = g.move.active ? 50 : -1;
-                int held     = held_timeout();
-                int for_held = held >= 0 && (wait < 0 || held < wait);
-                int n        = poll(fds, 2, for_held ? held : wait);
+                /* A MOVED_FROM waits for its MOVED_TO only so long, a file
+                 * held open until it's due, and a polled folder until it's
+                 * walked again */
+                int wait    = g.move.active ? 50 : -1;
+                int held    = held_timeout();
+                int walk    = poll_timeout();
+                int timeout = wait;
+                if (held >= 0 && (timeout < 0 || held < timeout)) timeout = held;
+                if (walk >= 0 && (timeout < 0 || walk < timeout)) timeout = walk;
+                int n = poll(fds, 2, timeout);
                 if (n == -1) {
                         if (errno == EINTR) continue;
                         LOG_ERR("poll");
                         return 1;
                 }
-                if (n == 0 && !for_held) move_flush();
+                if (n == 0 && wait >= 0 && timeout == wait) move_flush();
                 held_due(held_remote);
                 if ((fds[1].revents & POLLIN) && read_requests()) return 0; // it's gone
                 if (fds[1].revents & (POLLHUP | POLLERR)) return 0;
                 if ((fds[0].revents & POLLIN) && handle_events(fd, agent_event)) return 1;
+                poll_due();
         }
 }
 
